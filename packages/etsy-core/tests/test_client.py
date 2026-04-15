@@ -115,6 +115,16 @@ class TestExceptionMapping:
             await client.get("/legacy/forwarding")
 
     @pytest.mark.asyncio
+    async def test_405_maps_to_endpoint_removed(self, client, mock_httpx):
+        """PATCH on an endpoint that doesn't accept PATCH → EtsyEndpointRemoved."""
+        url = f"{DEFAULT_BASE_URL}/shops/1/listings/2/images/3"
+        mock_httpx.patch(url).mock(
+            return_value=httpx.Response(405, json={"error": "Method not allowed"})
+        )
+        with pytest.raises(EtsyEndpointRemoved, match="Method not allowed"):
+            await client.patch("/shops/1/listings/2/images/3", json={"alt_text": "x"})
+
+    @pytest.mark.asyncio
     async def test_400_maps_to_validation_error(self, client, mock_httpx):
         url = f"{DEFAULT_BASE_URL}/listings"
         mock_httpx.post(url).mock(return_value=httpx.Response(400, json={"error_description": "missing field"}))

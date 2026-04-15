@@ -31,7 +31,11 @@ from etsy_core.exceptions import EtsyAuthError
 
 logger = logging.getLogger(__name__)
 
-CALLBACK_HOST = "localhost"
+# Bind explicitly to 127.0.0.1 — not "localhost", which may resolve to ::1
+# on some systems and silently succeed while the browser hits 127.0.0.1,
+# or vice versa. Using an explicit IPv4 literal eliminates that ambiguity
+# and also avoids accidentally binding to a public interface.
+CALLBACK_HOST = "127.0.0.1"
 CALLBACK_PORT = 3456
 CALLBACK_PATH = "/callback"
 
@@ -39,13 +43,17 @@ CALLBACK_PATH = "/callback"
 class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     """One-shot HTTP handler that captures the OAuth callback.
 
-    The handler writes the received code + state into class attributes
-    so the main thread can read them after the server shuts down.
+    Received values are written into a per-call state_holder dict passed
+    by the owning server loop. Instance-scoped storage prevents state from
+    leaking across sequential login attempts in the same process.
     """
 
-    received_code: str | None = None
-    received_state: str | None = None
-    received_error: str | None = None
+    def __init__(self, *args: Any, state_holder: dict[str, Any], **kwargs: Any) -> None:
+        # state_holder must be set BEFORE super().__init__, because
+        # BaseHTTPRequestHandler.__init__ immediately handles the request
+        # and will call do_GET() from within super().__init__.
+        self.state_holder = state_holder
+        super().__init__(*args, **kwargs)
 
     def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler convention
         parsed = urllib.parse.urlparse(self.path)
@@ -61,9 +69,9 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         code = params.get("code", [None])[0]
         state = params.get("state", [None])[0]
 
-        _CallbackHandler.received_error = error
-        _CallbackHandler.received_code = code
-        _CallbackHandler.received_state = state
+        self.state_holder["error"] = error
+        self.state_holder["code"] = code
+        self.state_holder["state"] = state
 
         if error:
             body = f"Authorization failed: {error}. You can close this window.".encode()
@@ -87,13 +95,35 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _run_callback_server_until_received(timeout_seconds: float = 300) -> None:
-    """Start the callback server in a thread, wait for one request."""
-    server = http.server.HTTPServer((CALLBACK_HOST, CALLBACK_PORT), _CallbackHandler)
+def _run_callback_server_until_received(
+    timeout_seconds: float = 300,
+) -> dict[str, Any]:
+    """Start the callback server in a thread and wait for one request.
+
+    Returns a dict with keys 'code', 'state', 'error'. Values are None until
+    the callback is received. Bind failure is a hard error (security signal) —
+    we refuse to fall back to a different port silently.
+    """
+    state: dict[str, Any] = {"code": None, "state": None, "error": None}
+
+    def handler_factory(*args: Any, **kwargs: Any) -> _CallbackHandler:
+        return _CallbackHandler(*args, state_holder=state, **kwargs)
+
+    try:
+        server = http.server.HTTPServer(
+            (CALLBACK_HOST, CALLBACK_PORT), handler_factory
+        )
+    except OSError as exc:
+        raise EtsyAuthError(
+            f"Cannot bind OAuth callback server on {CALLBACK_HOST}:{CALLBACK_PORT}: "
+            f"{exc}. This usually means another etsy-mcp auth login is already "
+            f"running, or port {CALLBACK_PORT} is in use by another process."
+        ) from exc
+
     server.timeout = 1.0
 
     def serve() -> None:
-        while _CallbackHandler.received_code is None and _CallbackHandler.received_error is None:
+        while state["code"] is None and state["error"] is None:
             server.handle_request()
 
     thread = threading.Thread(target=serve, daemon=True)
@@ -102,6 +132,8 @@ def _run_callback_server_until_received(timeout_seconds: float = 300) -> None:
 
     if thread.is_alive():
         raise EtsyAuthError(f"OAuth callback timed out after {timeout_seconds}s")
+
+    return state
 
 
 def _require_credentials() -> tuple[str, str]:
@@ -133,17 +165,19 @@ async def _login(scopes: tuple[str, ...]) -> None:
     webbrowser.open(url)
 
     try:
-        _run_callback_server_until_received(timeout_seconds=300)
+        callback_state = _run_callback_server_until_received(timeout_seconds=300)
+    except EtsyAuthError:
+        raise
     except Exception as exc:
         raise EtsyAuthError(f"Failed to capture OAuth callback: {exc}") from exc
 
-    if _CallbackHandler.received_error:
-        raise EtsyAuthError(f"Authorization rejected: {_CallbackHandler.received_error}")
+    if callback_state["error"]:
+        raise EtsyAuthError(f"Authorization rejected: {callback_state['error']}")
 
-    if _CallbackHandler.received_state != state:
+    if callback_state["state"] != state:
         raise EtsyAuthError("State parameter mismatch — possible CSRF attempt. Aborting.")
 
-    code = _CallbackHandler.received_code
+    code = callback_state["code"]
     if not code:
         raise EtsyAuthError("No authorization code received in callback.")
 

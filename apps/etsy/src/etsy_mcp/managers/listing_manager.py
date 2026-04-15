@@ -316,7 +316,27 @@ class ListingManager:
 
         # Poll-verify: read the listing back and check that requested
         # fields actually applied. Eventual consistency is real.
-        verified = await self._poll_verify(listing_id, allowed)
+        verified, verify_ok = await self._poll_verify(listing_id, allowed)
+
+        if not verify_ok:
+            # Cycle 1 review fix: NEVER conflate "cannot verify" with
+            # "diverged state". If every poll-verify GET failed, we have
+            # NO information about the post-PATCH state — the PATCH itself
+            # returned 200 so it probably succeeded, but we can't prove it.
+            # Return a clearly-flagged verification_unavailable result.
+            warnings.append(
+                "PATCH was accepted by Etsy but post-update verification "
+                "polling failed (all GET attempts errored). Server state is "
+                "UNKNOWN. Re-read the listing manually to confirm the update."
+            )
+            return {
+                "requested": allowed,
+                "applied": {},
+                "diverged": {},
+                "ignored": rejected,
+                "warnings": warnings,
+                "verification_unavailable": True,
+            }
 
         applied = {k: verified.get(k) for k in allowed.keys()}
         diverged = {
@@ -331,20 +351,33 @@ class ListingManager:
             "diverged": diverged,
             "ignored": rejected,
             "warnings": warnings,
+            "verification_unavailable": False,
         }
 
     async def _poll_verify(
         self,
         listing_id: int,
         expected: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Poll the listing until expected fields converge or backoff exhausted."""
+    ) -> tuple[dict[str, Any], bool]:
+        """Poll the listing until expected fields converge or backoff exhausted.
+
+        Returns:
+            (state, verify_ok) tuple where:
+            - state: the most recent successful GET response, or empty dict
+            - verify_ok: True iff AT LEAST ONE GET succeeded during the poll
+                loop. When False, the caller MUST NOT compute diverged/applied
+                from the state dict — it will produce false positives. This
+                distinguishes "update was verified and these fields diverged"
+                from "we couldn't verify anything at all" (Cycle 1 review fix).
+        """
         last: dict[str, Any] = {}
+        verify_ok = False
         for delay in self._UPDATE_VERIFY_BACKOFF:
             try:
                 last = await self.get(listing_id)
+                verify_ok = True
                 if all(last.get(k) == v for k, v in expected.items()):
-                    return last
+                    return last, verify_ok
             except EtsyError as exc:
                 logger.warning(
                     "poll-verify GET failed for listing %s: %s",
@@ -355,13 +388,14 @@ class ListingManager:
         # Final read after last sleep
         try:
             last = await self.get(listing_id)
+            verify_ok = True
         except EtsyError as exc:
             logger.warning(
                 "final poll-verify GET failed for listing %s: %s",
                 listing_id,
                 exc,
             )
-        return last
+        return last, verify_ok
 
     async def delete(self, shop_id: int, listing_id: int) -> dict[str, Any]:
         """DELETE /shops/{shop_id}/listings/{listing_id} — destructive."""

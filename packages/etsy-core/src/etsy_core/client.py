@@ -303,11 +303,30 @@ class EtsyClient:
                     request_id=request_id,
                     detail=detail,
                 )
+            if status == 405:
+                # Method Not Allowed — the endpoint exists but doesn't accept this verb.
+                # This is the strongest signal for "endpoint doesn't support this operation"
+                # and should drive the fallback logic in managers that implement workarounds.
+                return EtsyEndpointRemoved(
+                    f"Method not allowed: {message} — this endpoint does not support the {method} verb",
+                    status=status,
+                    path=path,
+                    request_id=request_id,
+                    detail=detail,
+                )
             if status == 404:
-                # Distinguish resource-missing from endpoint-missing heuristically:
-                # if the path looks like a valid resource path (has an ID), treat as ResourceNotFound
-                has_numeric_segment = any(seg.isdigit() for seg in path.split("/"))
-                cls = EtsyResourceNotFound if has_numeric_segment else EtsyEndpointRemoved
+                # Distinguishing resource-missing from endpoint-missing on 404 is inherently
+                # ambiguous without a second probe. Heuristic:
+                # - GET on /foo/{N}: resource missing (endpoint exists — we just fetched)
+                # - Non-GET on /foo/{N}: prefer ResourceNotFound; caller (manager) can
+                #   verify via GET to distinguish if they implement a fallback path.
+                # - Any verb on a path with no numeric segment: probably endpoint-missing.
+                last_segment = path.rstrip("/").split("/")[-1]
+                has_numeric_leaf = last_segment.isdigit()
+                if method.upper() == "GET":
+                    cls = EtsyResourceNotFound if has_numeric_leaf else EtsyEndpointRemoved
+                else:
+                    cls = EtsyResourceNotFound if has_numeric_leaf else EtsyEndpointRemoved
                 return cls(
                     f"Not found: {message or path}",
                     status=status,

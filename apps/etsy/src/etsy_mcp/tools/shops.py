@@ -317,18 +317,39 @@ async def etsy_shop_sections_update(
         if not updates:
             return error_envelope("updates must not be empty")
 
+        manager = get_shop_manager()
+
         if not confirm:
+            # Preview: fetch current sections, locate this one, show diff.
+            sections = await manager.sections_list(shop_id)
+            current_section: dict[str, Any] | None = None
+            results = sections.get("results") if isinstance(sections, dict) else None
+            if isinstance(results, list):
+                for section in results:
+                    if (
+                        isinstance(section, dict)
+                        and section.get("shop_section_id") == shop_section_id
+                    ):
+                        current_section = section
+                        break
+            current_relevant = (
+                {k: current_section.get(k) for k in updates.keys()}
+                if current_section is not None
+                else None
+            )
             return {
                 "success": True,
                 "requires_confirmation": True,
                 "action": "update",
                 "resource_type": "shop_section",
                 "resource_id": str(shop_section_id),
-                "preview": {"proposed": updates},
+                "preview": {
+                    "current": current_relevant,
+                    "proposed": updates,
+                },
                 "message": f"Will update section {shop_section_id}. Set confirm=true to execute.",
             }
 
-        manager = get_shop_manager()
         data = await manager.sections_update(shop_id, shop_section_id, updates)
         return success_envelope(data, rate_limit=get_client().rate_limit_status())
     except EtsyError as exc:

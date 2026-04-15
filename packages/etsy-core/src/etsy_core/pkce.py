@@ -27,13 +27,26 @@ def generate_code_verifier(byte_length: int = 32) -> str:
 
     Args:
         byte_length: Number of random bytes. Default 32 yields a 43-char
-            base64url string. RFC 7636 requires 43-128 chars.
+            base64url string. RFC 7636 §4.1 requires a verifier between 43
+            and 128 characters, which corresponds to 32-96 bytes of entropy
+            after base64url encoding (4 * ceil(n/3) characters).
 
     Returns:
-        A URL-safe base64 string (no padding) suitable for use as code_verifier.
+        A URL-safe base64 string (no padding), 43-128 characters long,
+        suitable for use as code_verifier.
+
+    Raises:
+        ValueError: if byte_length is outside [32, 96]. Etsy rejects
+            verifiers outside the RFC 7636 bounds.
     """
     if byte_length < 32:
-        raise ValueError(f"byte_length must be >= 32 to meet RFC 7636 minimum, got {byte_length}")
+        raise ValueError(
+            f"byte_length must be >= 32 to meet RFC 7636 minimum (43 chars), got {byte_length}"
+        )
+    if byte_length > 96:
+        raise ValueError(
+            f"byte_length must be <= 96 to meet RFC 7636 maximum (128 chars), got {byte_length}"
+        )
     raw = secrets.token_bytes(byte_length)
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 

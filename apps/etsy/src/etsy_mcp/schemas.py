@@ -115,9 +115,15 @@ def partial_success_envelope(
     Used by bulk primitive tools (bulk_create_from_template, bulk_update_*,
     bulk_update_alt_text) to surface per-item success/failure.
 
-    The overall envelope is always `success: True` even if some items
-    failed — the bulk operation itself succeeded in the sense that it ran.
-    Per-item results are in the `data` payload.
+    Envelope `success` semantics (Cycle 1 review fix):
+    - Empty input (total == 0) → success=True (nothing to do is not failure)
+    - At least one item succeeded → success=True (partial success)
+    - All items failed → success=False (total failure is not success)
+
+    The previous version reported success=True unconditionally, which
+    deceived callers on all-items-failed runs. Per-item details still live
+    in the `data` payload (`created`, `updated`, `deleted`, `failed`), so
+    callers can always inspect the fine-grained outcome.
     """
     total = 0
     successful = 0
@@ -145,4 +151,19 @@ def partial_success_envelope(
     data["successful"] = successful
     data["failed_count"] = failed_count
 
-    return success_envelope(data, rate_limit=rate_limit)
+    # success = True only if at least one item succeeded OR there was
+    # nothing to do. All-failure must not masquerade as success.
+    envelope_success = total == 0 or successful > 0
+
+    envelope: dict[str, Any] = {
+        "success": envelope_success,
+        "data": redact_sensitive(data),
+    }
+    if rate_limit is not None:
+        envelope["rate_limit"] = rate_limit
+    if not envelope_success:
+        envelope["error"] = (
+            f"Bulk operation failed: 0 of {total} items succeeded. "
+            f"See data.failed for per-item errors."
+        )
+    return envelope

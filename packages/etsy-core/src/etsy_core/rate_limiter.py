@@ -25,7 +25,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -163,13 +163,25 @@ class DailyCounter:
                 self._persist()
 
     def remaining(self) -> int:
-        """Return the number of requests remaining in the daily budget."""
+        """Return the number of requests remaining in the daily budget.
+
+        Cycle 1 review fix: applies an inline UTC rollover check so a long-
+        running process that crosses midnight gets a correct remaining count
+        without waiting for the next `increment()` call. The check is
+        intentionally lock-free (a stale read here is acceptable — worst
+        case is a one-tick over/under-count, and the next `increment()` will
+        re-acquire the lock and observe the correct date). Reading the count
+        unlocked is safe because Python int reads are atomic under the GIL.
+        """
+        # Inline rollover check — if today's UTC date no longer matches the
+        # tracked date, the counter is logically zero (the next increment()
+        # will reset it under the lock).
+        if self._utc_date() != self._date:
+            return self.budget
         return max(0, self.budget - self._count)
 
     def reset_at_utc(self) -> str:
         """Return the UTC midnight when the counter resets, as ISO 8601."""
         now = datetime.now(timezone.utc)
-        from datetime import timedelta
-
         tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return tomorrow.isoformat().replace("+00:00", "Z")

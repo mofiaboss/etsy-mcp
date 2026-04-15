@@ -58,7 +58,7 @@ def fake_tokens() -> Tokens:
         access_token="fake-access-12345",
         refresh_token="fake-refresh-67890",
         expires_at=now + 3600,
-        granted_scopes=["shops_r", "listings_r"],
+        granted_scopes=frozenset({"shops_r", "listings_r"}),
         obtained_at=now,
     )
 
@@ -71,7 +71,7 @@ def expired_tokens() -> Tokens:
         access_token="expired-access",
         refresh_token="valid-refresh",
         expires_at=now - 60,  # already expired
-        granted_scopes=[],
+        granted_scopes=frozenset(),
         obtained_at=now - 3700,
     )
 

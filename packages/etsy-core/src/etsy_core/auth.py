@@ -23,7 +23,8 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, field
+import urllib.parse
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -66,23 +67,47 @@ DEFAULT_SCOPES = (
 REFRESH_LEAD_SECONDS = 60
 
 
-@dataclass
+@dataclass(frozen=True)
 class Tokens:
-    """OAuth token state.
+    """OAuth token state — IMMUTABLE.
+
+    Cycle 1 review fix: this dataclass is frozen and `granted_scopes` is a
+    `frozenset[str]` so callers cannot mutate authorization state after
+    construction (e.g., appending fake scopes to bypass scope checks).
+    Construction enforces invariants in `__post_init__`. The only legal
+    "needs refresh" state is the one produced by `bootstrap_from_refresh_token`.
 
     Attributes:
-        access_token: Bearer token for API requests
-        refresh_token: Used to mint new access tokens (rotates on each refresh)
-        expires_at: Unix timestamp when access_token expires
-        granted_scopes: Scopes actually granted by Etsy (may differ from requested)
-        obtained_at: Unix timestamp when tokens were obtained
+        access_token: Bearer token for API requests. May be empty ONLY when
+            the instance was produced by `bootstrap_from_refresh_token`.
+        refresh_token: Used to mint new access tokens (rotates on each refresh).
+            MUST be non-empty.
+        expires_at: Unix timestamp when access_token expires. May be 0 ONLY
+            when bootstrapping from env var.
+        granted_scopes: Scopes actually granted by Etsy. Frozen at construction.
+        obtained_at: Unix timestamp when tokens were obtained.
     """
 
     access_token: str
     refresh_token: str
     expires_at: int
-    granted_scopes: list[str] = field(default_factory=list)
+    granted_scopes: frozenset[str] = field(default_factory=frozenset)
     obtained_at: int = field(default_factory=lambda: int(time.time()))
+
+    def __post_init__(self) -> None:
+        # Refresh token is the only true invariant — without it we cannot
+        # ever mint a new access token, so an instance with no refresh_token
+        # is structurally useless and should be rejected at construction.
+        if not self.refresh_token or not self.refresh_token.strip():
+            raise ValueError(
+                "Tokens.refresh_token must be non-empty. "
+                "Use Tokens.bootstrap_from_refresh_token() for the env-var case."
+            )
+        # access_token + expires_at can be empty/zero only in the bootstrap
+        # case (where they will be filled in by the next refresh call).
+        # We don't enforce a strict combination here because the same shape
+        # is used as a transient "force refresh" sentinel; downstream
+        # `is_expired` already handles expires_at=0 correctly.
 
     @property
     def is_expired(self) -> bool:
@@ -90,7 +115,18 @@ class Tokens:
         return time.time() >= (self.expires_at - REFRESH_LEAD_SECONDS)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        """Serialize to a JSON-compatible dict.
+
+        Note: granted_scopes is converted from frozenset to a sorted list
+        for stable on-disk representation (json doesn't natively handle sets).
+        """
+        return {
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "expires_at": self.expires_at,
+            "granted_scopes": sorted(self.granted_scopes),
+            "obtained_at": self.obtained_at,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Tokens:
@@ -98,8 +134,27 @@ class Tokens:
             access_token=data["access_token"],
             refresh_token=data["refresh_token"],
             expires_at=int(data["expires_at"]),
-            granted_scopes=list(data.get("granted_scopes", [])),
+            granted_scopes=frozenset(data.get("granted_scopes", [])),
             obtained_at=int(data.get("obtained_at", time.time())),
+        )
+
+    @classmethod
+    def bootstrap_from_refresh_token(cls, refresh_token: str) -> Tokens:
+        """Construct a 'needs immediate refresh' Tokens instance.
+
+        Used by the ETSY_REFRESH_TOKEN env var fallback path: we have a
+        refresh token but no access token yet. The next call to
+        `EtsyAuth.get_access_token()` will trigger a refresh that fills in
+        the real access_token + expires_at + granted_scopes.
+        """
+        if not refresh_token or not refresh_token.strip():
+            raise ValueError("bootstrap_from_refresh_token requires a non-empty refresh_token")
+        return cls(
+            access_token="",
+            refresh_token=refresh_token.strip(),
+            expires_at=0,  # Forces is_expired=True immediately
+            granted_scopes=frozenset(),
+            obtained_at=int(time.time()),
         )
 
 
@@ -154,13 +209,7 @@ class EtsyAuth:
         # construct an in-memory token state that will refresh on first use.
         if self._initial_refresh_env and not self.token_path.exists():
             logger.info("Loading refresh token from ETSY_REFRESH_TOKEN env var (headless mode)")
-            self._tokens = Tokens(
-                access_token="",
-                refresh_token=self._initial_refresh_env,
-                expires_at=0,  # Force immediate refresh
-                granted_scopes=[],
-                obtained_at=int(time.time()),
-            )
+            self._tokens = Tokens.bootstrap_from_refresh_token(self._initial_refresh_env)
             return self._tokens
 
         if not self.token_path.exists():
@@ -221,17 +270,21 @@ class EtsyAuth:
         verifier, challenge = generate_pkce_pair()
         state = generate_state()
 
-        scope_str = " ".join(scopes)
+        # Build the query string via urllib.parse.urlencode for correct escaping
+        # of keys AND values. The previous implementation used
+        # httpx.QueryParams({k: v})[k] which returns unescaped values — scope
+        # strings with spaces (e.g. "shops_r shops_w") landed raw in the URL
+        # and produced malformed authorization requests. Caught in Cycle 1 review.
         params = {
             "response_type": "code",
             "client_id": self.keystring,
             "redirect_uri": self.redirect_uri,
-            "scope": scope_str,
+            "scope": " ".join(scopes),
             "state": state,
             "code_challenge": challenge,
             "code_challenge_method": CODE_CHALLENGE_METHOD,
         }
-        query = "&".join(f"{k}={httpx.QueryParams({k: v})[k]}" for k, v in params.items())
+        query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
         url = f"{ETSY_AUTH_URL}?{query}"
         return url, verifier, state
 
@@ -288,14 +341,31 @@ class EtsyAuth:
         return await self._refresh_with_lock(tokens)
 
     async def _refresh_with_lock(self, tokens: Tokens) -> Tokens:
-        """Acquire file lock and perform the refresh, allowing another process
-        to have already done it in the interim.
+        """Acquire file lock and perform the refresh.
 
-        The post-lock re-check only short-circuits if the on-disk refresh_token
-        is DIFFERENT from the one we were asked to refresh — that indicates
-        another process already rotated the token pair while we were waiting
-        for the lock. If the on-disk tokens still match what we have, we
-        perform the refresh ourselves.
+        Concurrency contract (Cycle 1 review fix):
+        The authoritative state for a refresh is ALWAYS whatever is on disk
+        AT THE MOMENT the lock is held, not whatever was passed in as an
+        argument. The caller's `tokens` argument is a hint about the caller's
+        expected previous state — but between the caller grabbing that
+        reference and the lock being acquired, any number of other coroutines
+        or sibling processes may have rotated the token pair.
+
+        Sequence under the lock:
+        1. Re-read tokens.json from disk (authoritative)
+        2. If disk tokens exist AND are not expired AND access_token is
+           non-empty → another refresher already did the work; return them
+        3. Otherwise, use the DISK tokens (not the argument) as input to the
+           refresh API call. Never send a stale refresh_token just because
+           our caller held an outdated reference.
+        4. If disk tokens are missing entirely, fall back to the caller's
+           argument (the caller may be bootstrapping from an env var).
+
+        This fix closes the race window identified in Cycle 1 review where
+        a coroutine holding a stale pre-rotation reference would POST the
+        already-rotated refresh_token to Etsy, get `invalid_grant`, and
+        force the user to re-login despite a valid refresh token being on
+        disk.
         """
         lock_path = self.token_path.with_suffix(".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -303,27 +373,40 @@ class EtsyAuth:
         with open(lock_path, "w") as lock_file:
             try:
                 os.chmod(lock_path, 0o600)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.warning(
+                    "Could not set 0600 on lock file %s: %s", lock_path, exc
+                )
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             try:
-                # Re-check: another process may have refreshed while we waited.
-                # Short-circuit ONLY if the on-disk refresh_token is different
-                # (indicating a successful rotation by another process) AND the
-                # on-disk access token is still valid.
-                fresh = self.load_tokens()
-                if (
-                    fresh is not None
-                    and fresh.refresh_token
-                    and fresh.refresh_token != tokens.refresh_token
-                    and not fresh.is_expired
-                    and fresh.access_token
-                ):
-                    logger.debug("Another process already refreshed; using their tokens")
-                    return fresh
+                # Step 1: authoritative re-read from disk
+                disk_tokens = self.load_tokens()
 
-                # Do the actual refresh
-                return await self._refresh_unlocked(tokens)
+                # Step 2: another refresher may have already done the work
+                if (
+                    disk_tokens is not None
+                    and disk_tokens.refresh_token
+                    and disk_tokens.access_token
+                    and not disk_tokens.is_expired
+                ):
+                    logger.debug(
+                        "Another refresher already rotated tokens; adopting on-disk state"
+                    )
+                    return disk_tokens
+
+                # Step 3: use disk tokens as input if available (authoritative),
+                # otherwise fall back to the caller's argument (bootstrap case).
+                refresh_input = disk_tokens if (
+                    disk_tokens is not None and disk_tokens.refresh_token
+                ) else tokens
+
+                if refresh_input is None or not refresh_input.refresh_token:
+                    raise EtsyAuthError(
+                        "No refresh token available inside refresh lock. "
+                        "Run `etsy-mcp auth login` to re-authenticate."
+                    )
+
+                return await self._refresh_unlocked(refresh_input)
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -365,20 +448,47 @@ class EtsyAuth:
         return new_tokens
 
     def _parse_token_response(self, data: dict[str, Any]) -> Tokens:
-        """Convert an Etsy token endpoint response into a Tokens object."""
+        """Convert an Etsy token endpoint response into a Tokens object.
+
+        Cycle 1 review fix: validates that `expires_in` is a positive integer.
+        A malicious or broken response with `expires_in=0` or negative would
+        produce tokens that compute `is_expired=True` immediately AND have a
+        fresh refresh_token — which would trigger an infinite refresh loop on
+        the next request. Defend explicitly.
+        """
         required = ("access_token", "refresh_token", "expires_in")
         missing = [k for k in required if k not in data]
         if missing:
             raise EtsyAuthError(f"Etsy token response missing required fields: {missing}")
 
+        try:
+            expires_in = int(data["expires_in"])
+        except (TypeError, ValueError) as exc:
+            raise EtsyAuthError(
+                f"Etsy token response has non-integer expires_in: {data.get('expires_in')!r}"
+            ) from exc
+
+        if expires_in <= 0:
+            raise EtsyAuthError(
+                f"Etsy token response has non-positive expires_in: {expires_in}. "
+                f"Refusing to construct Tokens that would loop forever."
+            )
+
+        if not data["access_token"] or not str(data["access_token"]).strip():
+            raise EtsyAuthError("Etsy token response has empty access_token")
+        if not data["refresh_token"] or not str(data["refresh_token"]).strip():
+            raise EtsyAuthError("Etsy token response has empty refresh_token")
+
         now = int(time.time())
         scope = data.get("scope", "")
-        granted_scopes = scope.split() if isinstance(scope, str) else list(scope)
+        granted_scopes = (
+            frozenset(scope.split()) if isinstance(scope, str) else frozenset(scope)
+        )
 
         return Tokens(
             access_token=data["access_token"],
             refresh_token=data["refresh_token"],
-            expires_at=now + int(data["expires_in"]),
+            expires_at=now + expires_in,
             granted_scopes=granted_scopes,
             obtained_at=now,
         )

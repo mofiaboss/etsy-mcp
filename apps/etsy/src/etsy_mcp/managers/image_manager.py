@@ -32,7 +32,9 @@ from etsy_core.exceptions import (
     EtsyEndpointRemoved,
     EtsyError,
     EtsyResourceNotFound,
+    EtsyValidationError,
 )
+from etsy_core.safe_http import UnsafeURLError, safe_fetch
 
 logger = logging.getLogger(__name__)
 
@@ -84,18 +86,22 @@ class ImageManager:
         scheme = parsed.scheme.lower()
 
         if scheme in ("http", "https"):
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http:
-                resp = await http.get(image_source)
-                resp.raise_for_status()
-                content = resp.content
-                if len(content) > MAX_IMAGE_BYTES:
-                    raise EtsyError(
-                        f"Downloaded image from {image_source} is {len(content)} bytes, "
-                        f"exceeds max {MAX_IMAGE_BYTES}"
-                    )
-                content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                filename = Path(parsed.path).name or "image.jpg"
-                return content, filename, content_type
+            try:
+                content, raw_content_type = await safe_fetch(
+                    image_source, max_bytes=MAX_IMAGE_BYTES
+                )
+            except UnsafeURLError as exc:
+                raise EtsyValidationError(
+                    f"image_source URL rejected by SSRF protection: {exc}"
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise EtsyError(
+                    f"Failed to download image_source {image_source}: "
+                    f"{exc.__class__.__name__}"
+                ) from exc
+            content_type = (raw_content_type or "image/jpeg").split(";")[0].strip()
+            filename = Path(parsed.path).name or "image.jpg"
+            return content, filename, content_type
 
         # File path: accept file:// or bare path
         path_str = parsed.path if scheme == "file" else image_source
@@ -185,7 +191,7 @@ class ImageManager:
         )
 
     # -------------------------------------------------------------------------
-    # Alt text update — primary PATCH path with destructive fallback
+    # Alt text update — primary PATCH path with upload-first destructive fallback
     # -------------------------------------------------------------------------
 
     async def update_alt_text(
@@ -194,11 +200,36 @@ class ImageManager:
         listing_id: int,
         listing_image_id: int,
         alt_text: str,
+        *,
+        allow_destructive_fallback: bool = False,
     ) -> dict[str, Any]:
-        """Try PATCH first; fall back to delete + re-upload if PATCH unavailable.
+        """Update alt_text on a listing image.
+
+        Primary path: PATCH the existing image metadata. Fast, non-destructive.
+
+        Fallback path (requires ``allow_destructive_fallback=True``): if Etsy
+        does not support PATCH on listing images, upload a new image first
+        (with the updated alt_text and preserved content type), verify the
+        upload succeeded, THEN delete the old image. This upload-first order
+        is rollback-safe: if upload fails, the old image is untouched and we
+        surface a clear error.
+
+        The PATCH path can fail with:
+        - ``EtsyEndpointRemoved`` (405 or 404 on a non-numeric path) —
+          unambiguous "endpoint verb not supported"; proceed to fallback.
+        - ``EtsyResourceNotFound`` — ambiguous on non-GET; could be a real
+          404 or a disguised "endpoint unsupported". We verify with a GET
+          on the same resource. If GET succeeds, the resource exists and
+          the PATCH verb is unsupported → proceed to fallback. If GET also
+          404s, it's a real missing resource → re-raise.
 
         Returns:
-            {"path_used": "patch" | "delete_reupload", "data": <etsy response>}
+            dict with keys:
+            - ``path_used``: ``"patch"`` | ``"upload_then_delete"``
+            - ``data``: updated or newly-uploaded image dict
+            - ``new_listing_image_id``: new image id if fallback ran, else ``None``
+            - ``old_listing_image_id``: the original image id
+            - ``warnings``: list of human-readable warning strings
         """
         # ---- Method 1: PATCH ------------------------------------------------
         try:
@@ -211,19 +242,48 @@ class ImageManager:
                 listing_image_id,
                 listing_id,
             )
-            return {"path_used": "patch", "data": result}
-        except EtsyEndpointRemoved:
-            # PATCH endpoint does not exist for ShopListingImage — fall through
-            logger.warning(
-                "PATCH endpoint unavailable for ShopListingImage; "
-                "falling back to delete+reupload for image %d",
+            return {
+                "path_used": "patch",
+                "data": result,
+                "new_listing_image_id": None,
+                "old_listing_image_id": listing_image_id,
+                "warnings": [],
+            }
+        except EtsyEndpointRemoved as exc:
+            # Unambiguous: Etsy returned 405, or 404 on a non-numeric path.
+            logger.info(
+                "Image PATCH unavailable (%s); considering fallback for image %d",
+                exc.message,
                 listing_image_id,
             )
-        except EtsyResourceNotFound:
-            # Real 404 (image doesn't exist) — surface as-is
-            raise
+        except EtsyResourceNotFound as exc:
+            # Ambiguous on non-GET: could be a real 404 or disguised endpoint-not-supported.
+            # Verify by GETting the resource.
+            try:
+                await self.client.get(
+                    f"/shops/{shop_id}/listings/{listing_id}/images/{listing_image_id}"
+                )
+            except EtsyResourceNotFound:
+                # Resource really is missing — propagate the original error.
+                raise exc
+            logger.info(
+                "Image %d PATCH failed with 404 but GET succeeds; "
+                "treating as endpoint-verb-unsupported and considering fallback",
+                listing_image_id,
+            )
 
-        # ---- Method 2: Delete + re-upload ----------------------------------
+        # ---- Fallback gate --------------------------------------------------
+        if not allow_destructive_fallback:
+            raise EtsyError(
+                f"Cannot update alt_text on image {listing_image_id}: "
+                f"Etsy does not support the PATCH verb on listing images. "
+                f"Re-run with allow_destructive_fallback=True to use the "
+                f"upload-first-then-delete workaround (briefly creates a "
+                f"duplicate image before removing the original; may change "
+                f"the listing_image_id)."
+            )
+
+        # ---- Method 2: Upload-first, then delete ---------------------------
         current = await self.get(shop_id, listing_id, listing_image_id)
         image_url = (
             current.get("url_fullxfull")
@@ -232,56 +292,123 @@ class ImageManager:
         )
         if not image_url:
             raise EtsyError(
-                "Cannot fall back to delete+reupload: current image has no retrievable URL"
+                f"Cannot run destructive fallback: image {listing_image_id} "
+                f"has no retrievable URL"
             )
         original_rank = current.get("rank", 1)
 
-        # Download original bytes BEFORE deleting (preserve content)
+        # Download original bytes + detect content type from the CDN response.
+        # Uses safe_fetch even for Etsy-provided CDN URLs (defense in depth
+        # against redirect chains mapping to internal hosts or content-length
+        # abuse). The old image is still intact if this fails — no rollback.
         try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http:
-                resp = await http.get(image_url)
-                resp.raise_for_status()
-                image_bytes = resp.content
-                if len(image_bytes) > MAX_IMAGE_BYTES:
-                    raise EtsyError(
-                        f"Original image is {len(image_bytes)} bytes, exceeds max {MAX_IMAGE_BYTES}"
-                    )
-                content_type = (
-                    resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
-                )
+            image_bytes, raw_content_type = await safe_fetch(
+                image_url, max_bytes=MAX_IMAGE_BYTES
+            )
+        except UnsafeURLError as exc:
+            raise EtsyError(
+                f"Etsy CDN image URL rejected by SSRF protection: {exc}. "
+                f"Old image {listing_image_id} is still intact — no rollback needed."
+            ) from exc
         except httpx.HTTPError as exc:
             raise EtsyError(
-                f"Failed to download original image content for fallback: {exc.__class__.__name__}"
+                f"Failed to download original image content for fallback: "
+                f"{exc.__class__.__name__}. Old image {listing_image_id} is "
+                f"still intact — no rollback needed."
             ) from exc
+        content_type = (
+            (raw_content_type or "image/jpeg").split(";")[0].strip().lower()
+        )
 
-        # Delete current image
-        await self.delete(shop_id, listing_id, listing_image_id)
+        # Derive a sane filename from the detected content type so we don't
+        # downgrade PNG/WebP to image.jpg and force Etsy to re-encode.
+        ext_map = {
+            "image/jpeg": "jpg",
+            "image/jpg": "jpg",
+            "image/pjpeg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+            "image/gif": "gif",
+        }
+        ext = ext_map.get(content_type, "jpg")
+        filename = f"image.{ext}"
 
-        # Re-upload with new alt_text and original rank
+        # Upload new image FIRST — do not touch the old one yet.
         try:
-            result = await self.client.post(
+            new_image = await self.client.post(
                 f"/shops/{shop_id}/listings/{listing_id}/images",
-                files={"image": ("image.jpg", image_bytes, content_type)},
+                files={"image": (filename, image_bytes, content_type)},
                 data={
                     "alt_text": alt_text,
-                    "rank": original_rank,
+                    "rank": str(original_rank),
                 },
             )
-        except Exception as exc:
-            logger.error(
-                "CRITICAL: image %d was deleted but re-upload failed (%s). "
-                "The listing is now missing this image.",
-                listing_image_id,
-                exc,
-            )
+        except EtsyError as exc:
+            # Upload failed — old image is still intact. No rollback needed.
             raise EtsyError(
-                f"Image {listing_image_id} was deleted but re-upload failed: "
-                f"{exc.__class__.__name__}. The image is now MISSING from listing {listing_id}."
+                f"Alt_text update via fallback failed at upload step: "
+                f"{exc.message}. Old image {listing_image_id} is still intact "
+                f"— no rollback needed."
             ) from exc
 
+        new_listing_image_id = new_image.get("listing_image_id")
+        if not new_listing_image_id:
+            raise EtsyError(
+                f"Upload succeeded but new image has no listing_image_id; "
+                f"aborting before delete. Old image {listing_image_id} is "
+                f"still intact."
+            )
+
+        # Verify new image is reachable before we delete the old one.
+        try:
+            await self.get(shop_id, listing_id, int(new_listing_image_id))
+        except EtsyError as exc:
+            raise EtsyError(
+                f"New image {new_listing_image_id} was uploaded but is not yet "
+                f"readable: {exc.message}. Old image {listing_image_id} is "
+                f"still intact; no rollback performed. Retry this operation later."
+            ) from exc
+
+        # Delete old image. If this fails we're left with a duplicate — surface
+        # a warning but return successfully so the caller knows the alt_text is
+        # live on the new image.
+        try:
+            await self.delete(shop_id, listing_id, listing_image_id)
+        except EtsyError as exc:
+            logger.warning(
+                "Delete of old image %d failed after successful upload of new image %d: %s",
+                listing_image_id,
+                new_listing_image_id,
+                exc.message,
+            )
+            return {
+                "path_used": "upload_then_delete",
+                "data": new_image,
+                "new_listing_image_id": int(new_listing_image_id),
+                "old_listing_image_id": listing_image_id,
+                "warnings": [
+                    f"Upload succeeded but delete of old image {listing_image_id} "
+                    f"failed ({exc.message}). The listing now has a DUPLICATE image. "
+                    f"Manual cleanup required: delete image {listing_image_id} via "
+                    f"the Etsy dashboard or call etsy_listing_images_delete."
+                ],
+            }
+
         logger.warning(
-            "Image %d recreated via delete+reupload (new id may differ; rank=%s)",
+            "Image %d replaced via upload-then-delete with new image %d (rank=%s)",
             listing_image_id,
+            new_listing_image_id,
             original_rank,
         )
-        return {"path_used": "delete_reupload", "data": result}
+        return {
+            "path_used": "upload_then_delete",
+            "data": new_image,
+            "new_listing_image_id": int(new_listing_image_id),
+            "old_listing_image_id": listing_image_id,
+            "warnings": [
+                f"Original image {listing_image_id} was replaced with new image "
+                f"{new_listing_image_id} (same file, new alt_text). Rank preserved "
+                f"as {original_rank}. Callers tracking the old listing_image_id "
+                f"(e.g. variation-image maps) must update to the new id."
+            ],
+        }

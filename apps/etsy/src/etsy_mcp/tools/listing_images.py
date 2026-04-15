@@ -200,10 +200,12 @@ async def etsy_listing_images_upload(
 @server.tool(
     name="etsy_listing_images_update_alt_text",
     description="Update the alt_text on a single listing image. The implementation tries a "
-    "PATCH endpoint first; if Etsy does not expose PATCH for ShopListingImage, it falls back "
-    "to a DESTRUCTIVE delete + re-upload (preserving original file bytes and rank). "
-    "If the fallback path's re-upload fails, the image will be MISSING from the listing. "
-    "Requires confirm=True. The new image_id may differ from the original after fallback.",
+    "PATCH endpoint first (fast, non-destructive). If Etsy does not expose PATCH for "
+    "ShopListingImage, the tool ERRORS OUT by default. Set allow_destructive_fallback=True "
+    "to opt in to an upload-first-then-delete workaround that briefly creates a duplicate "
+    "image (preserving original file bytes, content type, and rank) before removing the "
+    "original. The fallback produces a NEW listing_image_id — callers tracking the old id "
+    "(e.g. variation-image maps) must update. Requires confirm=True.",
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=True,
@@ -218,14 +220,33 @@ async def etsy_listing_images_update_alt_text(
     listing_id: int,
     listing_image_id: int,
     alt_text: str,
+    allow_destructive_fallback: bool = False,
     confirm: bool = False,
 ) -> dict[str, Any]:
-    """Update alt_text on a single image (try PATCH then fallback)."""
+    """Update alt_text on a single image (try PATCH then optionally fallback)."""
     try:
         if alt_text is None:
             return error_envelope("alt_text must be provided (use empty string to clear)")
 
         if not confirm:
+            warnings = [
+                "Primary path: PATCH endpoint — fast, non-destructive, same listing_image_id.",
+            ]
+            if allow_destructive_fallback:
+                warnings.append(
+                    "Fallback path (enabled): if Etsy does not accept PATCH, this tool will "
+                    "UPLOAD a new image first (same bytes, new alt_text), verify it is live, "
+                    "THEN delete the original. The listing will briefly hold a DUPLICATE "
+                    "image. The new listing_image_id differs from the original — callers "
+                    "tracking the old id must update. If the delete step fails after a "
+                    "successful upload, the duplicate remains and manual cleanup is required."
+                )
+            else:
+                warnings.append(
+                    "Fallback path (disabled): if Etsy does not accept PATCH, this tool will "
+                    "ERROR. Re-run with allow_destructive_fallback=true to opt into the "
+                    "upload-first-then-delete workaround."
+                )
             return {
                 "success": True,
                 "requires_confirmation": True,
@@ -233,26 +254,34 @@ async def etsy_listing_images_update_alt_text(
                 "resource_type": "listing_image",
                 "resource_id": str(listing_image_id),
                 "preview": {
-                    "proposed": {"alt_text": alt_text},
+                    "proposed": {
+                        "alt_text": alt_text,
+                        "allow_destructive_fallback": allow_destructive_fallback,
+                    },
                 },
-                "warnings": [
-                    "Primary path: PATCH endpoint (non-destructive).",
-                    "Fallback path (if PATCH unavailable): DELETE + re-upload. "
-                    "Rank is preserved but the listing_image_id will change. "
-                    "If re-upload fails, the image will be MISSING from the listing.",
-                ],
+                "warnings": warnings,
                 "message": (
                     f"Will update alt_text on image {listing_image_id} (listing {listing_id}). "
-                    "May fall back to destructive delete+reupload. Set confirm=true to execute."
+                    f"Destructive fallback is {'ENABLED' if allow_destructive_fallback else 'disabled'}. "
+                    "Set confirm=true to execute."
                 ),
             }
 
         manager = get_image_manager()
-        result = await manager.update_alt_text(shop_id, listing_id, listing_image_id, alt_text)
+        result = await manager.update_alt_text(
+            shop_id,
+            listing_id,
+            listing_image_id,
+            alt_text,
+            allow_destructive_fallback=allow_destructive_fallback,
+        )
         return success_envelope(
             {
                 "path_used": result["path_used"],
                 "image": result["data"],
+                "new_listing_image_id": result.get("new_listing_image_id"),
+                "old_listing_image_id": result.get("old_listing_image_id"),
+                "warnings": result.get("warnings", []),
             },
             rate_limit=get_client().rate_limit_status(),
         )
@@ -277,10 +306,13 @@ async def etsy_listing_images_update_alt_text(
     name="etsy_listing_images_bulk_update_alt_text",
     description="BULK PRIMITIVE: update alt_text on many images across listings in one call. "
     "updates is a list of {listing_id, listing_image_id, alt_text} dicts. Each item is "
-    "processed via the same try-PATCH-then-fallback logic as the single-item tool. "
-    "Returns a partial-success envelope with per-item path_used ('patch' or 'delete_reupload'). "
-    "DESTRUCTIVE if any item falls back. Requires confirm=True. This tool makes NO decisions "
-    "about content — the caller (LLM) must already know which alt_text to set on each image.",
+    "processed via the same try-PATCH-then-optional-fallback logic as the single-item tool. "
+    "Returns a partial-success envelope with per-item path_used ('patch' or 'upload_then_delete'). "
+    "If allow_destructive_fallback=False (default), items where Etsy rejects PATCH are "
+    "isolated in the failed list and the rest succeed. If allow_destructive_fallback=True, "
+    "those items run an upload-first-then-delete workaround which briefly creates a "
+    "duplicate image and produces a new listing_image_id. Requires confirm=True. This "
+    "tool makes NO decisions about content — the caller (LLM) provides each alt_text.",
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=True,
@@ -293,6 +325,7 @@ async def etsy_listing_images_update_alt_text(
 async def etsy_listing_images_bulk_update_alt_text(
     shop_id: int,
     updates: list[dict[str, Any]],
+    allow_destructive_fallback: bool = False,
     confirm: bool = False,
 ) -> dict[str, Any]:
     """Bulk update alt_text across many images."""

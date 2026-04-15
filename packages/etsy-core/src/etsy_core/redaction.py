@@ -17,10 +17,16 @@ from typing import Any
 #: tool envelopes. Expanded beyond godaddy-mcp's set to include OAuth tokens
 #: and buyer PII specific to Etsy's transaction data.
 #:
-#: Additions vs godaddy-mcp:
-#: - OAuth: access_token, refresh_token, shared_secret, keystring, client_secret
-#: - PII from Etsy receipts: email, first_name, last_name, name
-#: - User identifier: etsy_user_id
+#: IMPORTANT — field selection rationale (Cycle 1 review fix):
+#: - `user_id` and `client_id` are DELIBERATELY NOT in this set despite looking
+#:   sensitive. Etsy uses `user_id` as the public buyer/user primary key across
+#:   receipts, transactions, reviews, and users/* endpoints. Redacting it would
+#:   gut every response that a caller explicitly asked for. The PII-adjacent
+#:   identifier is `etsy_user_id` (a separate field), not `user_id`.
+#: - `client_id` is the OAuth app identifier — public by spec, and Etsy also
+#:   returns unrelated `client_id` fields in some contexts. Safe to leave.
+#: - Only redact fields that are (a) actual secrets (tokens, shared_secret,
+#:   Authorization header) or (b) unambiguous PII (email, first/last name).
 SENSITIVE_FIELDS: frozenset[str] = frozenset(
     {
         # OAuth credentials and tokens
@@ -29,7 +35,6 @@ SENSITIVE_FIELDS: frozenset[str] = frozenset(
         "shared_secret",
         "keystring",
         "client_secret",
-        "client_id",  # not sensitive alone but combined with secret is
         "Authorization",
         "x-api-key",
         # Buyer PII from receipts and transactions
@@ -37,9 +42,8 @@ SENSITIVE_FIELDS: frozenset[str] = frozenset(
         "first_name",
         "last_name",
         "name",
-        # User identifiers
+        # User identifier (PII-adjacent, distinct from public user_id)
         "etsy_user_id",
-        "user_id",
         # Legacy from godaddy-mcp — harmless to include
         "authCode",
     }

@@ -22,8 +22,36 @@ class TestSensitiveFieldsCoverage:
             assert field in SENSITIVE_FIELDS
 
     def test_user_id_fields_present(self):
+        """Cycle 1 fix CONV-2 — only `etsy_user_id` is redacted, NOT `user_id`.
+
+        `user_id` is Etsy's public buyer/user primary key. Redacting it would
+        gut every receipt/transaction/review response. Only the PII-adjacent
+        `etsy_user_id` is in the sensitive set.
+        """
         assert "etsy_user_id" in SENSITIVE_FIELDS
-        assert "user_id" in SENSITIVE_FIELDS
+        assert "user_id" not in SENSITIVE_FIELDS
+
+    def test_user_id_passes_through_redaction(self):
+        """Cycle 1 fix CONV-2 — verify a real receipt-shaped payload preserves user_id."""
+        receipt = {
+            "receipt_id": 12345,
+            "user_id": 67890,  # MUST NOT be redacted
+            "buyer_user_id": 67890,
+            "name": "Alice Smith",  # MUST be redacted (buyer PII)
+            "email": "alice@example.com",  # MUST be redacted
+        }
+        out = redact_sensitive(receipt)
+        assert out["receipt_id"] == 12345
+        assert out["user_id"] == 67890  # preserved
+        assert out["buyer_user_id"] == 67890  # preserved
+        assert out["name"] == REDACTED_PLACEHOLDER  # redacted
+        assert out["email"] == REDACTED_PLACEHOLDER  # redacted
+
+    def test_client_id_passes_through_redaction(self):
+        """Cycle 1 fix CONV-2 — `client_id` is no longer redacted."""
+        out = redact_sensitive({"client_id": "abc123", "client_secret": "shhh"})
+        assert out["client_id"] == "abc123"  # preserved
+        assert out["client_secret"] == REDACTED_PLACEHOLDER  # still redacted
 
     def test_legacy_authcode_carried_forward(self):
         assert "authCode" in SENSITIVE_FIELDS

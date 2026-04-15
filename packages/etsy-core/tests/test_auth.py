@@ -48,7 +48,7 @@ class TestTokensDataclass:
             access_token="a",
             refresh_token="r",
             expires_at=1000,
-            granted_scopes=["x", "y"],
+            granted_scopes=frozenset({"x", "y"}),
             obtained_at=900,
         )
         restored = Tokens.from_dict(original.to_dict())
@@ -66,6 +66,47 @@ class TestTokensDataclass:
         # REFRESH_LEAD_SECONDS is 60 — anything within 60s counts as expired
         t = Tokens(access_token="a", refresh_token="r", expires_at=int(time.time()) + 30)
         assert t.is_expired is True
+
+    def test_empty_refresh_token_rejected_at_construction(self):
+        """Cycle 1 fix SA-7 — Tokens enforces refresh_token invariant."""
+        with pytest.raises(ValueError, match="refresh_token must be non-empty"):
+            Tokens(access_token="a", refresh_token="", expires_at=1000)
+        with pytest.raises(ValueError, match="refresh_token must be non-empty"):
+            Tokens(access_token="a", refresh_token="   ", expires_at=1000)
+
+    def test_frozen_dataclass_cannot_be_mutated(self):
+        """Cycle 1 fix SA-7 — Tokens is immutable."""
+        from dataclasses import FrozenInstanceError
+
+        t = Tokens(access_token="a", refresh_token="r", expires_at=1000)
+        with pytest.raises(FrozenInstanceError):
+            t.access_token = "hijacked"  # type: ignore[misc]
+
+    def test_granted_scopes_frozenset_cannot_be_appended(self):
+        """Cycle 1 fix SA-7 — granted_scopes is immutable, no privilege escalation."""
+        t = Tokens(
+            access_token="a",
+            refresh_token="r",
+            expires_at=1000,
+            granted_scopes=frozenset({"shops_r"}),
+        )
+        # frozenset has no add/append method — attempting to mutate raises
+        assert isinstance(t.granted_scopes, frozenset)
+        with pytest.raises(AttributeError):
+            t.granted_scopes.add("shops_w")  # type: ignore[attr-defined]
+
+    def test_bootstrap_from_refresh_token(self):
+        """Cycle 1 fix SA-7 — explicit constructor for the env-var bootstrap case."""
+        t = Tokens.bootstrap_from_refresh_token("env-refresh-token")
+        assert t.refresh_token == "env-refresh-token"
+        assert t.access_token == ""
+        assert t.expires_at == 0
+        assert t.is_expired is True
+        assert t.granted_scopes == frozenset()
+
+    def test_bootstrap_rejects_empty(self):
+        with pytest.raises(ValueError, match="non-empty refresh_token"):
+            Tokens.bootstrap_from_refresh_token("")
 
 
 class TestEtsyAuthConstruction:
@@ -170,12 +211,19 @@ class TestBuildAuthorizationUrl:
 
 class TestRefresh:
     @pytest.mark.asyncio
-    async def test_refresh_rotates_tokens(self, auth_factory, fake_tokens, mock_httpx, token_endpoint_success):
+    async def test_refresh_rotates_tokens(self, auth_factory, expired_tokens, mock_httpx, token_endpoint_success):
+        """Cycle 1 fix CONV-3 — refresh uses on-disk state as authoritative.
+
+        The test now seeds the disk with EXPIRED tokens (not fresh ones),
+        because the rewritten _refresh_with_lock short-circuits when the
+        on-disk state is already valid. Calling refresh on already-fresh
+        tokens is a no-op by design (no wasted API call).
+        """
         auth = auth_factory()
-        auth.save_tokens(fake_tokens)
+        auth.save_tokens(expired_tokens)
         mock_httpx.post(ETSY_TOKEN_URL).mock(return_value=httpx.Response(200, json=token_endpoint_success))
 
-        new_tokens = await auth.refresh(fake_tokens)
+        new_tokens = await auth.refresh(expired_tokens)
         assert new_tokens.access_token == token_endpoint_success["access_token"]
         assert new_tokens.refresh_token == token_endpoint_success["refresh_token"]
         # Fresh instance reads the rotated token from disk
@@ -183,31 +231,52 @@ class TestRefresh:
         assert on_disk["refresh_token"] == token_endpoint_success["refresh_token"]
 
     @pytest.mark.asyncio
-    async def test_refresh_invalid_grant_is_terminal(self, auth_factory, fake_tokens, mock_httpx):
+    async def test_refresh_short_circuits_when_disk_is_fresh(
+        self, auth_factory, fake_tokens, mock_httpx
+    ):
+        """Cycle 1 fix CONV-3 — calling refresh with already-fresh disk
+        tokens does NOT hit the network; it just adopts the disk state.
+        """
         auth = auth_factory()
         auth.save_tokens(fake_tokens)
+        # Mock the endpoint but assert it is NEVER called
+        token_route = mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(200, json={"access_token": "should-not-fire"})
+        )
+
+        result = await auth.refresh(fake_tokens)
+        assert result.access_token == fake_tokens.access_token
+        assert token_route.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_refresh_invalid_grant_is_terminal(self, auth_factory, expired_tokens, mock_httpx):
+        auth = auth_factory()
+        auth.save_tokens(expired_tokens)
         mock_httpx.post(ETSY_TOKEN_URL).mock(
             return_value=httpx.Response(400, json={"error": "invalid_grant", "error_description": "Token revoked"})
         )
         with pytest.raises(EtsyAuthError, match="invalid_grant"):
-            await auth.refresh(fake_tokens)
+            await auth.refresh(expired_tokens)
 
     @pytest.mark.asyncio
-    async def test_refresh_with_no_refresh_token_raises(self, auth_factory):
+    async def test_refresh_with_no_tokens_at_all_raises(self, auth_factory):
+        """Cycle 1 fix SA-7 — Tokens with empty refresh_token can no longer
+        be constructed. Test the equivalent state by passing None and having
+        no on-disk tokens or env var fallback.
+        """
         auth = auth_factory()
-        empty = Tokens(access_token="x", refresh_token="", expires_at=0)
         with pytest.raises(EtsyAuthError, match="No refresh token"):
-            await auth.refresh(empty)
+            await auth.refresh(None)
 
     @pytest.mark.asyncio
-    async def test_refresh_other_error_raises_auth_error(self, auth_factory, fake_tokens, mock_httpx):
+    async def test_refresh_other_error_raises_auth_error(self, auth_factory, expired_tokens, mock_httpx):
         auth = auth_factory()
-        auth.save_tokens(fake_tokens)
+        auth.save_tokens(expired_tokens)
         mock_httpx.post(ETSY_TOKEN_URL).mock(
             return_value=httpx.Response(500, json={"error_description": "internal"})
         )
         with pytest.raises(EtsyAuthError, match="Token refresh failed"):
-            await auth.refresh(fake_tokens)
+            await auth.refresh(expired_tokens)
 
     @pytest.mark.asyncio
     async def test_refresh_does_not_leak_secrets_in_logs(self, auth_factory, fake_tokens, mock_httpx, token_endpoint_success, caplog):
