@@ -15,3 +15,17 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+# Cycle 2 fix P1-E: explicit testpaths + importmode=importlib lets
+# `uv run pytest` from the workspace root discover all three packages
+# without colliding on identically-named `tests` package directories.
+# Per-package invocation (`uv run --package etsy-core pytest packages/etsy-core/tests`)
+# also still works.
+asyncio_mode = "auto"
+testpaths = [
+    "packages/etsy-core/tests",
+    "packages/etsy-mcp-shared/tests",
+    "apps/etsy/tests/unit",
+]
+addopts = ["--import-mode=importlib"]

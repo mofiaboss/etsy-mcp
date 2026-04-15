@@ -1,6 +1,6 @@
 """MCP tool module: shops category.
 
-9 tools:
+10 tools:
 - etsy_shops_get_me
 - etsy_shops_get_by_id
 - etsy_shops_get_by_owner_user_id

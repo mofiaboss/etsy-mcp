@@ -18,7 +18,6 @@ from typing import Iterator
 import httpx
 import pytest
 import respx
-
 from etsy_core.auth import EtsyAuth, Tokens
 
 

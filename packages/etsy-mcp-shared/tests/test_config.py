@@ -1,10 +1,8 @@
 """Tests for the shared config module."""
 
 import logging
-from pathlib import Path
 
 import pytest
-
 from etsy_mcp_shared.config import load_yaml_config, setup_logging
 
 

@@ -1,6 +1,5 @@
 """Tests for the shared validators module."""
 
-import pytest
 
 from etsy_mcp_shared.validators import ResourceValidator, create_response
 

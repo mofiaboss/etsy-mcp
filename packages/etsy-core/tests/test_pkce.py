@@ -6,7 +6,6 @@ import base64
 import hashlib
 
 import pytest
-
 from etsy_core.pkce import (
     CODE_CHALLENGE_METHOD,
     derive_code_challenge,
@@ -38,6 +37,12 @@ class TestGenerateCodeVerifier:
         with pytest.raises(ValueError, match="must be >= 32"):
             generate_code_verifier(byte_length=16)
 
+    def test_byte_length_above_max_raises(self):
+        with pytest.raises(ValueError, match="<= 96"):
+            generate_code_verifier(byte_length=97)
+        with pytest.raises(ValueError, match="<= 96"):
+            generate_code_verifier(byte_length=200)
+
     def test_larger_byte_length_yields_longer_verifier(self):
         v32 = generate_code_verifier(32)
         v64 = generate_code_verifier(64)
@@ -47,7 +52,8 @@ class TestGenerateCodeVerifier:
 class TestDeriveCodeChallenge:
     def test_challenge_is_sha256_of_verifier(self):
         verifier = "test-verifier-12345"
-        expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).decode("ascii").rstrip("=")
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        expected = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
         assert derive_code_challenge(verifier) == expected
 
     def test_challenge_is_43_chars(self):

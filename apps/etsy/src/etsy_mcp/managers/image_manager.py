@@ -21,6 +21,7 @@ formatting and confirm gating.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
@@ -115,8 +116,11 @@ class ImageManager:
             raise EtsyError(
                 f"image_source {path} is {size} bytes, exceeds max {MAX_IMAGE_BYTES}"
             )
-        with path.open("rb") as fh:
-            content = fh.read()
+        # Cycle 2 fix P0-A: wrap the blocking disk read in asyncio.to_thread.
+        # The previous synchronous `path.open("rb").read()` could burn 250-500ms
+        # of event loop time on a 25MiB read, starving every other coroutine
+        # including the OAuth refresh lock.
+        content = await asyncio.to_thread(path.read_bytes)
 
         # Best-effort content-type from extension
         ext = path.suffix.lower().lstrip(".")

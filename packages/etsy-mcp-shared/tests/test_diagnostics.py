@@ -1,10 +1,8 @@
 """Tests for the shared diagnostics module."""
 
-import asyncio
 from unittest.mock import MagicMock
 
 import pytest
-
 from etsy_mcp_shared.diagnostics import (
     _redact,
     _safe_json,

@@ -1,9 +1,6 @@
 """Tests for the shared bootstrap module."""
 
 import logging
-import os
-
-import pytest
 
 from etsy_mcp_shared.bootstrap import validate_registration_mode
 

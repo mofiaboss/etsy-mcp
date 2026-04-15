@@ -31,9 +31,16 @@ logger = logging.getLogger(__name__)
 def is_retryable_http_error(exc: BaseException) -> bool:
     """Determine whether an httpx exception is retryable.
 
+    This predicate is method-agnostic — it answers "is this exception class
+    one we WOULD retry IF the caller marked the request as idempotent?". The
+    actual idempotency check happens in `client._request`, which only runs
+    this predicate on idempotent calls (GET + explicitly-marked PUT). Non-
+    idempotent calls (POST, PATCH, DELETE) never reach this predicate.
+
     Returns True for:
-    - httpx.TimeoutException on a GET (handled externally — this returns True)
-    - httpx.HTTPStatusError with status 429 or 5xx
+    - httpx.TimeoutException (idempotent reads should retry once on timeout)
+    - httpx.HTTPStatusError with status 429 (rate limited)
+    - httpx.HTTPStatusError with status 5xx (server error)
 
     Returns False for:
     - All other exceptions

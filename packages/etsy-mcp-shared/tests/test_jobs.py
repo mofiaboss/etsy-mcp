@@ -3,8 +3,7 @@
 import asyncio
 
 import pytest
-
-from etsy_mcp_shared.jobs import JOBS, JobStore, get_job_status, start_async_tool
+from etsy_mcp_shared.jobs import JobStore, get_job_status, start_async_tool
 
 
 class TestJobStore:

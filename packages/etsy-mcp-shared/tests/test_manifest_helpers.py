@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from etsy_mcp_shared.manifest_helpers import get_tool_annotations
 
 

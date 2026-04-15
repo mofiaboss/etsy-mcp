@@ -1,6 +1,5 @@
 """Tests for the shared config_helpers module."""
 
-import pytest
 
 from etsy_mcp_shared.config_helpers import parse_config_bool
 

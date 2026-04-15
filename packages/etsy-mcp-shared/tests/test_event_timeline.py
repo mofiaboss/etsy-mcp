@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-import pytest
-
-from etsy_mcp_shared.event_timeline import NormalizedEvent, merge_timelines, filter_by_area
+from etsy_mcp_shared.event_timeline import NormalizedEvent, filter_by_area, merge_timelines
 
 
 class TestNormalizedEvent:

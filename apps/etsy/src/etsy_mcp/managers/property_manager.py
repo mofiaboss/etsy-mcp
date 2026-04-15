@@ -1,7 +1,8 @@
 """Property manager — wraps Etsy ListingProperty endpoints.
 
-3 operations:
+4 operations:
 - list: list all properties on a listing
+- get_one: fetch a single property by id
 - update: fetch-merge-put a single property
 - delete: delete a property from a listing
 

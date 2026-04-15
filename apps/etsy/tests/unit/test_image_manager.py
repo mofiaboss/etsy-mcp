@@ -26,17 +26,15 @@ Coverage:
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
-
 from etsy_core.exceptions import (
     EtsyEndpointRemoved,
     EtsyError,
     EtsyResourceNotFound,
 )
 from etsy_mcp.managers.image_manager import ImageManager
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

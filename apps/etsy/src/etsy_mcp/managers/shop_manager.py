@@ -1,14 +1,14 @@
 """Shop manager — wraps Etsy Shop + ShopSection + ShopProductionPartner endpoints.
 
-9 operations:
+10 operations:
 - get_me: return the authenticated user's own shop
 - get_by_id: get a shop by shop_id
 - get_by_owner_user_id: get a shop by its owner's user_id
 - search: search shops by keyword
-- update: fetch-merge-put on a shop
+- update: fetch-merge-PATCH on a shop (uses real fetch + merge + PATCH)
 - sections_list: list shop sections
 - sections_create: create a new shop section
-- sections_update: fetch-merge-put on a section
+- sections_update: fetch-merge-PUT on a section (idempotent=True)
 - sections_delete: delete a section
 - production_partners_list: list the shop's production partners
 
@@ -225,20 +225,30 @@ class ShopManager:
 
     @staticmethod
     def _find_section(
-        sections_response: dict[str, Any],
+        sections_response: dict[str, Any] | list[dict[str, Any]],
         shop_section_id: int,
     ) -> dict[str, Any] | None:
-        """Locate a section dict inside a sections_list response envelope.
+        """Locate a section dict inside a sections_list response.
 
-        Etsy wraps collections in `{"count": n, "results": [...]}`. This
-        helper tolerates both the wrapped and unwrapped shapes so the
-        manager is resilient to minor response-shape changes.
+        Etsy v3 wraps collections in `{"count": n, "results": [...]}`. This
+        helper handles BOTH that wrapped shape AND a bare list of section
+        dicts (defense against minor response-shape changes — Cycle 2 fix
+        for a docstring-vs-code discrepancy where the original docstring
+        claimed dual-shape support but the code only handled the wrapped form).
+        Returns None when the section is not found OR when the response
+        shape is unrecognized.
         """
-        results = sections_response.get("results")
-        if isinstance(results, list):
-            for section in results:
-                if isinstance(section, dict) and section.get("shop_section_id") == shop_section_id:
-                    return section
+        if isinstance(sections_response, list):
+            results: list[Any] = sections_response
+        elif isinstance(sections_response, dict):
+            maybe_results = sections_response.get("results")
+            results = maybe_results if isinstance(maybe_results, list) else []
+        else:
+            return None
+
+        for section in results:
+            if isinstance(section, dict) and section.get("shop_section_id") == shop_section_id:
+                return section
         return None
 
     async def sections_delete(

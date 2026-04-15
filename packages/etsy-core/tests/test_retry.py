@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
-
 from etsy_core.retry import (
     _extract_retry_after,
     _wait_retry_after_or_exponential,

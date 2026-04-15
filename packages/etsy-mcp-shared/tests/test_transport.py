@@ -1,11 +1,9 @@
 """Tests for shared transport lifecycle management."""
 
-import asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from etsy_mcp_shared.transport import resolve_http_config, run_transports
 
 

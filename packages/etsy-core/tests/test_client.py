@@ -4,9 +4,6 @@ from __future__ import annotations
 
 import httpx
 import pytest
-import respx
-
-from etsy_core.auth import EtsyAuth, Tokens
 from etsy_core.client import DEFAULT_BASE_URL, EtsyClient
 from etsy_core.exceptions import (
     EtsyAuthError,
@@ -83,6 +80,110 @@ class TestPostNoRetry:
         mock_httpx.post(url).mock(side_effect=httpx.ReadTimeout("slow"))
         with pytest.raises(EtsyPossiblyCompletedError, match="MAY have completed"):
             await client.post("/listings", json={"title": "test"})
+
+
+class TestPatchDoesNotRetry:
+    @pytest.mark.asyncio
+    async def test_patch_does_not_retry_on_500(self, client, mock_httpx):
+        url = f"{DEFAULT_BASE_URL}/shops/1/listings/2"
+        route = mock_httpx.patch(url).mock(
+            return_value=httpx.Response(500, json={"error": "boom"})
+        )
+        with pytest.raises(EtsyServerError):
+            await client.patch("/shops/1/listings/2", json={"title": "x"})
+        assert route.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_patch_does_not_retry_on_429(self, client, mock_httpx):
+        url = f"{DEFAULT_BASE_URL}/shops/1/listings/2"
+        route = mock_httpx.patch(url).mock(
+            return_value=httpx.Response(
+                429,
+                headers={"Retry-After": "1"},
+                json={"error_description": "slow down"},
+            )
+        )
+        with pytest.raises(EtsyRateLimitError):
+            await client.patch("/shops/1/listings/2", json={"title": "x"})
+        assert route.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_patch_timeout_raises_possibly_completed(self, client, mock_httpx):
+        url = f"{DEFAULT_BASE_URL}/shops/1/listings/2"
+        mock_httpx.patch(url).mock(side_effect=httpx.ReadTimeout("slow"))
+        with pytest.raises(EtsyPossiblyCompletedError, match="DO NOT blindly retry"):
+            await client.patch("/shops/1/listings/2", json={"title": "x"})
+
+
+class TestDeleteDoesNotRetry:
+    @pytest.mark.asyncio
+    async def test_delete_does_not_retry_on_500(self, client, mock_httpx):
+        url = f"{DEFAULT_BASE_URL}/shops/1/listings/2"
+        route = mock_httpx.delete(url).mock(
+            return_value=httpx.Response(500, json={"error": "boom"})
+        )
+        with pytest.raises(EtsyServerError):
+            await client.delete("/shops/1/listings/2")
+        assert route.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_does_not_retry_on_429(self, client, mock_httpx):
+        url = f"{DEFAULT_BASE_URL}/shops/1/listings/2"
+        route = mock_httpx.delete(url).mock(
+            return_value=httpx.Response(
+                429,
+                headers={"Retry-After": "1"},
+                json={"error_description": "slow down"},
+            )
+        )
+        with pytest.raises(EtsyRateLimitError):
+            await client.delete("/shops/1/listings/2")
+        assert route.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_timeout_raises_possibly_completed(self, client, mock_httpx):
+        url = f"{DEFAULT_BASE_URL}/shops/1/listings/2"
+        mock_httpx.delete(url).mock(side_effect=httpx.ReadTimeout("slow"))
+        with pytest.raises(EtsyPossiblyCompletedError, match="DO NOT blindly retry"):
+            await client.delete("/shops/1/listings/2")
+
+
+class TestDebugLogRedaction:
+    @pytest.mark.asyncio
+    async def test_request_debug_log_does_not_contain_authorization_header(
+        self, client, fake_tokens, mock_httpx, caplog
+    ):
+        import logging
+
+        caplog.set_level(logging.DEBUG, logger="etsy_core.client")
+        url = f"{DEFAULT_BASE_URL}/users/me/shops"
+        mock_httpx.get(url).mock(return_value=httpx.Response(200, json={"shop_id": 1}))
+        await client.get("/users/me/shops")
+        for record in caplog.records:
+            if record.name != "etsy_core.client":
+                continue
+            msg = record.getMessage()
+            assert "Authorization" not in msg
+            assert "Bearer" not in msg
+            assert fake_tokens.access_token not in msg
+            assert client.auth.get_keystring() not in msg
+
+    @pytest.mark.asyncio
+    async def test_request_debug_log_does_not_contain_request_body(
+        self, client, mock_httpx, caplog
+    ):
+        import logging
+
+        caplog.set_level(logging.DEBUG, logger="etsy_core.client")
+        url = f"{DEFAULT_BASE_URL}/listings"
+        mock_httpx.post(url).mock(return_value=httpx.Response(200, json={"ok": True}))
+        await client.post("/listings", json={"sensitive": "value-do-not-log"})
+        for record in caplog.records:
+            if record.name != "etsy_core.client":
+                continue
+            msg = record.getMessage()
+            assert "sensitive" not in msg
+            assert "value-do-not-log" not in msg
 
 
 class TestExceptionMapping:

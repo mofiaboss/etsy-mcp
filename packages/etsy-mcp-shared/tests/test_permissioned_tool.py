@@ -5,7 +5,6 @@ import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from etsy_mcp_shared.permissioned_tool import _infer_input_schema, create_permissioned_tool
 
 
@@ -44,7 +43,12 @@ def mock_deps():
 
     checker = MagicMock()
     checker.check = MagicMock(return_value=True)
-    checker.denial_message = MagicMock(return_value="Delete is disabled by policy for cat. Set ETSY_POLICY_NETWORK_CAT_DELETE=true to enable.")
+    checker.denial_message = MagicMock(
+        return_value=(
+            "Delete is disabled by policy for cat. "
+            "Set ETSY_POLICY_NETWORK_CAT_DELETE=true to enable."
+        )
+    )
 
     return {
         "original_tool_decorator": fake_tool_decorator,

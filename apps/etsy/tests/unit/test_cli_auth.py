@@ -12,10 +12,8 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from etsy_core.exceptions import EtsyAuthError
 from etsy_mcp.cli import auth as auth_mod
-
 
 # ---------------------------------------------------------------------------
 # Helpers — a fake request/client wrapper for BaseHTTPRequestHandler

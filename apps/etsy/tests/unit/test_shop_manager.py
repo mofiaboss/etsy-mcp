@@ -12,11 +12,8 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-
 from etsy_core.exceptions import EtsyValidationError
-
 from etsy_mcp.managers.shop_manager import ShopManager
-
 
 # ---------------------------------------------------------------------------
 # Read operations — trivial delegation

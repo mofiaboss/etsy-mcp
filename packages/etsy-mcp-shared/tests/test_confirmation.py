@@ -1,6 +1,5 @@
 """Tests for the shared confirmation/preview utilities."""
 
-import pytest
 
 from etsy_mcp_shared.confirmation import (
     create_preview,

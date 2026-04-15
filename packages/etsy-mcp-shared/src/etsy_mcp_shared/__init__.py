@@ -10,12 +10,12 @@ from etsy_mcp_shared.confirmation import (
 )
 from etsy_mcp_shared.formatting import error_response, success_response
 from etsy_mcp_shared.jobs import JOBS, JobStore, get_job_status, start_async_tool
-from etsy_mcp_shared.manifest_helpers import get_tool_annotations
 from etsy_mcp_shared.lazy_tools import (
     LazyToolLoader,
     build_tool_module_map,
     setup_lazy_loading,
 )
+from etsy_mcp_shared.manifest_helpers import get_tool_annotations
 from etsy_mcp_shared.meta_tools import register_load_tools, register_meta_tools
 from etsy_mcp_shared.policy_gate import PolicyGateChecker
 from etsy_mcp_shared.tool_loader import auto_load_tools

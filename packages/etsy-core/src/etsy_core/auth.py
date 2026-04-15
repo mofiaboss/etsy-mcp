@@ -38,6 +38,26 @@ logger = logging.getLogger(__name__)
 ETSY_AUTH_URL = "https://www.etsy.com/oauth/connect"
 ETSY_TOKEN_URL = "https://api.etsy.com/v3/public/oauth/token"
 
+
+def _safe_json_body(response: httpx.Response) -> dict[str, Any]:
+    """Parse a non-200 OAuth response body without crashing on malformed JSON.
+
+    Cycle 2 fix P1-A: Etsy proxies sometimes return HTML 502 pages with
+    misleading `Content-Type: application/json` headers, or truncated bodies
+    that pass the content-type check but fail to parse. The previous direct
+    `response.json()` call crashed with a raw JSONDecodeError stack trace
+    instead of producing a clean EtsyAuthError. This helper degrades to an
+    empty dict so the caller can construct a clean error message.
+    """
+    content_type = response.headers.get("content-type", "")
+    if not content_type.startswith("application/json"):
+        return {}
+    try:
+        body = response.json()
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
 #: Default scope set for the "full seller" profile.
 #: Covers every permission needed for listing management, orders, shipping,
 #: and buyer interaction. Users can request a narrower set via the CLI
@@ -309,15 +329,27 @@ class EtsyAuth:
             )
 
         if response.status_code != 200:
-            # Don't leak the code or verifier — just the status and safe error description
-            body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            # Cycle 2 fix P1-A: wrap the JSON parse in try/except. A malformed
+            # body with a JSON-shaped Content-Type header (Etsy proxy returning
+            # an HTML 502 page or a truncated body) used to crash exchange_code
+            # with a raw stack trace instead of a clean EtsyAuthError.
+            body = _safe_json_body(response)
             error_desc = body.get("error_description") or body.get("error") or "(no description)"
             raise EtsyAuthError(
                 f"Token exchange failed (HTTP {response.status_code}): {error_desc}",
                 status=response.status_code,
             )
 
-        tokens = self._parse_token_response(response.json())
+        # Same defense for the success path — a 200 with malformed JSON should
+        # raise a clean EtsyAuthError, not a raw JSONDecodeError.
+        try:
+            response_body = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise EtsyAuthError(
+                "Token exchange returned 200 with malformed JSON body — refusing to parse"
+            ) from exc
+
+        tokens = self._parse_token_response(response_body)
         self.save_tokens(tokens)
         logger.info("Initial token exchange successful. Granted scopes: %s", tokens.granted_scopes)
         return tokens
@@ -428,7 +460,8 @@ class EtsyAuth:
                 raise EtsyAuthError(f"Refresh request failed: {exc.__class__.__name__}") from exc
 
         if response.status_code != 200:
-            body = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
+            # Cycle 2 fix P1-A: same defensive parse as exchange_code.
+            body = _safe_json_body(response)
             error = body.get("error") or "unknown"
             error_desc = body.get("error_description") or "(no description)"
 
@@ -442,7 +475,14 @@ class EtsyAuth:
                 status=response.status_code,
             )
 
-        new_tokens = self._parse_token_response(response.json())
+        try:
+            response_body = response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise EtsyAuthError(
+                "Token refresh returned 200 with malformed JSON body — refusing to parse"
+            ) from exc
+
+        new_tokens = self._parse_token_response(response_body)
         self.save_tokens(new_tokens)
         logger.info("Tokens refreshed successfully. New expiry: %d", new_tokens.expires_at)
         return new_tokens

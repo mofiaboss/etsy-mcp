@@ -10,8 +10,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-import respx
-
 from etsy_core.auth import (
     DEFAULT_SCOPES,
     ETSY_TOKEN_URL,
@@ -166,6 +164,42 @@ class TestSaveAndLoadTokens:
         tmp_path = auth.token_path.with_suffix(".tmp")
         assert not tmp_path.exists()
 
+    def test_save_atomic_crash_preserves_old(self, auth_factory, monkeypatch):
+        """If os.replace fails mid-save, the previously-saved tokens must
+        remain readable and the temp file must not linger."""
+        auth = auth_factory()
+        tokens_v1 = Tokens(
+            access_token="v1-access",
+            refresh_token="v1-refresh",
+            expires_at=1_000_000,
+            obtained_at=900_000,
+        )
+        tokens_v2 = Tokens(
+            access_token="v2-access",
+            refresh_token="v2-refresh",
+            expires_at=2_000_000,
+            obtained_at=1_900_000,
+        )
+        auth.save_tokens(tokens_v1)
+
+        def _boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        with pytest.raises(EtsyAuthError, match="Failed to write token store"):
+            auth.save_tokens(tokens_v2)
+
+        # Reload fresh — must be v1, not v2
+        monkeypatch.undo()  # allow os.replace to work again if needed (no-op here)
+        fresh = EtsyAuth(keystring="test-keystring", token_path=auth.token_path)
+        loaded = fresh.load_tokens()
+        assert loaded is not None
+        assert loaded.access_token == "v1-access"
+        assert loaded.expires_at == 1_000_000
+        # No stray temp file
+        tmp_path = auth.token_path.with_suffix(".tmp")
+        assert not tmp_path.exists()
+
 
 class TestEnvFallback:
     def test_refresh_env_creates_in_memory_state(self, auth_factory, monkeypatch):
@@ -207,6 +241,162 @@ class TestBuildAuthorizationUrl:
         url, _, _ = auth.build_authorization_url(scopes=("shops_r",))
         assert "shops_r" in url
         assert "listings_r" not in url
+
+
+class TestExchangeCode:
+    """Tests for EtsyAuth.exchange_code (authorization_code grant)."""
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_success_persists_tokens(
+        self, auth_factory, mock_httpx, token_endpoint_success
+    ):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(200, json=token_endpoint_success)
+        )
+        tokens = await auth.exchange_code("auth-code-abc", "verifier-xyz")
+        assert tokens.access_token == token_endpoint_success["access_token"]
+        assert tokens.refresh_token == token_endpoint_success["refresh_token"]
+        on_disk = json.loads(auth.token_path.read_text())
+        assert on_disk["access_token"] == token_endpoint_success["access_token"]
+        assert on_disk["refresh_token"] == token_endpoint_success["refresh_token"]
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_400_invalid_grant(self, auth_factory, mock_httpx):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={"error": "invalid_grant", "error_description": "code already used"},
+            )
+        )
+        with pytest.raises(EtsyAuthError, match="code already used"):
+            await auth.exchange_code("used-code", "verifier")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_400_invalid_request(self, auth_factory, mock_httpx):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(
+                400,
+                json={"error": "invalid_request", "error_description": "missing code_verifier"},
+            )
+        )
+        with pytest.raises(EtsyAuthError, match="missing code_verifier"):
+            await auth.exchange_code("code", "")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_500_server_error(self, auth_factory, mock_httpx):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(500, json={"error": "internal"})
+        )
+        with pytest.raises(EtsyAuthError, match="Token exchange failed"):
+            await auth.exchange_code("code", "verifier")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_response_missing_refresh_token(
+        self, auth_factory, mock_httpx
+    ):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(200, json={"access_token": "x", "expires_in": 3600})
+        )
+        with pytest.raises(EtsyAuthError, match="refresh_token"):
+            await auth.exchange_code("code", "verifier")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_response_with_zero_expires_in(
+        self, auth_factory, mock_httpx
+    ):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={"access_token": "a", "refresh_token": "r", "expires_in": 0},
+            )
+        )
+        with pytest.raises(EtsyAuthError, match="non-positive expires_in"):
+            await auth.exchange_code("code", "verifier")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_response_with_negative_expires_in(
+        self, auth_factory, mock_httpx
+    ):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={"access_token": "a", "refresh_token": "r", "expires_in": -1},
+            )
+        )
+        with pytest.raises(EtsyAuthError, match="non-positive expires_in"):
+            await auth.exchange_code("code", "verifier")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_response_with_non_int_expires_in(
+        self, auth_factory, mock_httpx
+    ):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "a",
+                    "refresh_token": "r",
+                    "expires_in": "not a number",
+                },
+            )
+        )
+        with pytest.raises(EtsyAuthError, match="non-integer expires_in"):
+            await auth.exchange_code("code", "verifier")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_response_with_empty_access_token(
+        self, auth_factory, mock_httpx
+    ):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={"access_token": "", "refresh_token": "r", "expires_in": 3600},
+            )
+        )
+        with pytest.raises(EtsyAuthError, match="empty access_token"):
+            await auth.exchange_code("code", "verifier")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_response_with_whitespace_access_token(
+        self, auth_factory, mock_httpx
+    ):
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={"access_token": "   ", "refresh_token": "r", "expires_in": 3600},
+            )
+        )
+        with pytest.raises(EtsyAuthError, match="empty access_token"):
+            await auth.exchange_code("code", "verifier")
+
+    @pytest.mark.asyncio
+    async def test_exchange_code_caplog_does_not_leak_secrets(
+        self, auth_factory, mock_httpx, token_endpoint_success, caplog
+    ):
+        import logging
+
+        caplog.set_level(logging.DEBUG)
+        auth = auth_factory()
+        mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(200, json=token_endpoint_success)
+        )
+        await auth.exchange_code("my-secret-code", "my-secret-verifier")
+        for record in caplog.records:
+            msg = record.getMessage()
+            assert "my-secret-code" not in msg
+            assert "my-secret-verifier" not in msg
+            assert token_endpoint_success["access_token"] not in msg
+            assert token_endpoint_success["refresh_token"] not in msg
 
 
 class TestRefresh:
@@ -279,7 +469,50 @@ class TestRefresh:
             await auth.refresh(expired_tokens)
 
     @pytest.mark.asyncio
-    async def test_refresh_does_not_leak_secrets_in_logs(self, auth_factory, fake_tokens, mock_httpx, token_endpoint_success, caplog):
+    async def test_refresh_with_stale_arg_uses_disk_state(
+        self, auth_factory, mock_httpx, token_endpoint_success
+    ):
+        """CONV-3: a stale in-memory Tokens arg must NOT leak its refresh_token
+        into the token endpoint POST. The on-disk refresh_token is authoritative.
+        """
+        import urllib.parse
+
+        auth = auth_factory()
+        # Seed disk with an expired tokens whose refresh_token is DISK_RT
+        disk_expired = Tokens(
+            access_token="disk-access",
+            refresh_token="DISK_RT",
+            expires_at=int(time.time()) - 60,
+            obtained_at=int(time.time()) - 3700,
+        )
+        auth.save_tokens(disk_expired)
+
+        # Stale in-memory reference held by some coroutine — older rotation
+        stale_tokens = Tokens(
+            access_token="stale-access",
+            refresh_token="STALE_RT",
+            expires_at=0,
+            obtained_at=0,
+        )
+
+        route = mock_httpx.post(ETSY_TOKEN_URL).mock(
+            return_value=httpx.Response(200, json=token_endpoint_success)
+        )
+
+        await auth.refresh(stale_tokens)
+
+        # Inspect the actual form body sent
+        assert route.call_count == 1
+        request = route.calls[0].request
+        body = request.content.decode("utf-8")
+        parsed = urllib.parse.parse_qs(body)
+        assert parsed["refresh_token"] == ["DISK_RT"]
+        assert "STALE_RT" not in body
+
+    @pytest.mark.asyncio
+    async def test_refresh_does_not_leak_secrets_in_logs(
+        self, auth_factory, fake_tokens, mock_httpx, token_endpoint_success, caplog
+    ):
         import logging
 
         caplog.set_level(logging.DEBUG)
@@ -317,7 +550,9 @@ class TestGetAccessToken:
 
 class TestRefreshLockSerialization:
     @pytest.mark.asyncio
-    async def test_concurrent_refresh_serializes(self, auth_factory, expired_tokens, mock_httpx, token_endpoint_success):
+    async def test_concurrent_refresh_serializes(
+        self, auth_factory, expired_tokens, mock_httpx, token_endpoint_success
+    ):
         """Two concurrent refreshes must serialize via the file lock — the second
         call should observe the freshly-rotated token instead of issuing a duplicate
         refresh that would invalidate the first rotation."""

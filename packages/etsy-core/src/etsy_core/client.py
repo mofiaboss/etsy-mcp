@@ -68,7 +68,14 @@ class EtsyClient:
         self.auth = auth
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        self._rate_limiter = _TokenBucket(capacity=int(rate_limit_per_second), refill_rate=rate_limit_per_second)
+        # Cycle 2 fix P1-B: capacity must be at least 1, otherwise a
+        # rate_limit_per_second value below 1.0 (e.g. 0.5 for very slow
+        # clients) would yield int(0.5)=0 capacity and `acquire()` would
+        # loop forever waiting for a token that can never fit in the bucket.
+        self._rate_limiter = _TokenBucket(
+            capacity=max(1, int(rate_limit_per_second)),
+            refill_rate=rate_limit_per_second,
+        )
         self._daily_counter = DailyCounter(budget=daily_budget, persist_path=daily_counter_path)
         self._http: httpx.AsyncClient | None = None
         self._retry_config = build_retry_config(max_attempts=3)
@@ -103,7 +110,12 @@ class EtsyClient:
         *,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """GET request with automatic retry on 429/5xx."""
+        """GET request with automatic retry on 429, 5xx, and timeouts.
+
+        Retries are delegated to `_retry_config` (tenacity) and honor the
+        `Retry-After` header when present. Idempotent by definition, so
+        retries are always safe.
+        """
         return await self._request("GET", path, params=params, json=None, idempotent=True)
 
     async def post(
@@ -317,16 +329,17 @@ class EtsyClient:
             if status == 404:
                 # Distinguishing resource-missing from endpoint-missing on 404 is inherently
                 # ambiguous without a second probe. Heuristic:
-                # - GET on /foo/{N}: resource missing (endpoint exists — we just fetched)
-                # - Non-GET on /foo/{N}: prefer ResourceNotFound; caller (manager) can
-                #   verify via GET to distinguish if they implement a fallback path.
-                # - Any verb on a path with no numeric segment: probably endpoint-missing.
+                # - Path ending in a numeric segment (resource ID): prefer ResourceNotFound.
+                #   The caller (typically a manager implementing a destructive fallback like
+                #   image_manager.update_alt_text) can verify via a follow-up GET to disambiguate.
+                # - Path NOT ending in a numeric segment: probably endpoint-missing.
+                #
+                # Cycle 2 fix: removed the `if method.upper() == "GET"` branch because both
+                # arms produced identical results. The actual "is the verb supported?" question
+                # is answered by the manager's GET probe, not by this static heuristic.
                 last_segment = path.rstrip("/").split("/")[-1]
                 has_numeric_leaf = last_segment.isdigit()
-                if method.upper() == "GET":
-                    cls = EtsyResourceNotFound if has_numeric_leaf else EtsyEndpointRemoved
-                else:
-                    cls = EtsyResourceNotFound if has_numeric_leaf else EtsyEndpointRemoved
+                cls = EtsyResourceNotFound if has_numeric_leaf else EtsyEndpointRemoved
                 return cls(
                     f"Not found: {message or path}",
                     status=status,

@@ -102,6 +102,18 @@ def update_with_verification_envelope(
     return success_envelope(data, rate_limit=rate_limit)
 
 
+#: Per-item statuses that count as "the server accepted this item".
+#: Cycle 2 fix P0-B: `diverged` MUST count as success because Etsy
+#: routinely normalizes input fields (price rounding, string trimming,
+#: tag casing). A bulk PATCH where every item was accepted by the server
+#: but one field per item got normalized used to report success=False
+#: with "0 of N items succeeded" — a worse semantic inversion than the
+#: original Cycle 1 SA-2 bug. The diverged status means "the PATCH
+#: succeeded, the server returned a different value than requested" —
+#: that's accepted-with-modification, not failure.
+SUCCESS_STATUSES: frozenset[str] = frozenset({"success", "diverged"})
+
+
 def partial_success_envelope(
     *,
     created: list[dict[str, Any]] | None = None,
@@ -115,33 +127,56 @@ def partial_success_envelope(
     Used by bulk primitive tools (bulk_create_from_template, bulk_update_*,
     bulk_update_alt_text) to surface per-item success/failure.
 
-    Envelope `success` semantics (Cycle 1 review fix):
+    Envelope `success` semantics:
     - Empty input (total == 0) → success=True (nothing to do is not failure)
     - At least one item succeeded → success=True (partial success)
     - All items failed → success=False (total failure is not success)
 
-    The previous version reported success=True unconditionally, which
-    deceived callers on all-items-failed runs. Per-item details still live
-    in the `data` payload (`created`, `updated`, `deleted`, `failed`), so
-    callers can always inspect the fine-grained outcome.
+    "Succeeded" includes both `status="success"` AND `status="diverged"`,
+    because diverged means "the server accepted the PATCH but returned a
+    normalized value" — that's still acceptance, not failure. See
+    SUCCESS_STATUSES for the canonical set.
+
+    Per-item details (success, diverged, failed counts plus the raw item
+    lists) live in the `data` payload so callers can always inspect the
+    fine-grained outcome.
     """
     total = 0
     successful = 0
+    diverged_count = 0
     failed_count = 0
+
+    def _count_successes(items: list[dict[str, Any]]) -> tuple[int, int]:
+        """Return (successful_count, diverged_count) for a per-item list."""
+        ok = 0
+        div = 0
+        for item in items:
+            status = item.get("status")
+            if status in SUCCESS_STATUSES:
+                ok += 1
+                if status == "diverged":
+                    div += 1
+        return ok, div
 
     data: dict[str, Any] = {}
     if created is not None:
         data["created"] = [redact_sensitive(item) for item in created]
         total += len(created)
-        successful += len([i for i in created if i.get("status") == "success"])
+        ok, div = _count_successes(created)
+        successful += ok
+        diverged_count += div
     if updated is not None:
         data["updated"] = [redact_sensitive(item) for item in updated]
         total += len(updated)
-        successful += len([i for i in updated if i.get("status") == "success"])
+        ok, div = _count_successes(updated)
+        successful += ok
+        diverged_count += div
     if deleted is not None:
         data["deleted"] = [redact_sensitive(item) for item in deleted]
         total += len(deleted)
-        successful += len([i for i in deleted if i.get("status") == "success"])
+        ok, div = _count_successes(deleted)
+        successful += ok
+        diverged_count += div
     if failed is not None:
         data["failed"] = [redact_sensitive(item) for item in failed]
         total += len(failed)
@@ -149,6 +184,7 @@ def partial_success_envelope(
 
     data["total"] = total
     data["successful"] = successful
+    data["diverged_count"] = diverged_count
     data["failed_count"] = failed_count
 
     # success = True only if at least one item succeeded OR there was

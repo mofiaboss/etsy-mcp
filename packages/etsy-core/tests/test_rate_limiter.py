@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from etsy_core.rate_limiter import DailyBudgetExceeded, DailyCounter, _TokenBucket
 
 

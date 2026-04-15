@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from etsy_core.exceptions import (
     EtsyAuthError,
     EtsyEndpointRemoved,

@@ -8,7 +8,6 @@ from typing import Any
 import httpx
 import pytest
 import respx
-
 from etsy_core.safe_http import (
     BLOCKED_HOSTS,
     UnsafeURLError,
@@ -16,7 +15,6 @@ from etsy_core.safe_http import (
     safe_fetch,
     validate_fetch_url,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
