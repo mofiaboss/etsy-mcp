@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
@@ -68,13 +69,16 @@ class EtsyClient:
         self.auth = auth
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-        # Cycle 2 fix P1-B: capacity must be at least 1, otherwise a
-        # rate_limit_per_second value below 1.0 (e.g. 0.5 for very slow
-        # clients) would yield int(0.5)=0 capacity and `acquire()` would
-        # loop forever waiting for a token that can never fit in the bucket.
+        # Cycle 2 fix P1-B + Cycle 3 hardening: capacity must be at least 1
+        # AND refill_rate must be positive. A rate_limit_per_second value
+        # below 1.0 (e.g. 0.5 for very slow clients) used to yield int(0.5)=0
+        # capacity and `acquire()` would loop forever. A negative refill_rate
+        # from a misconfigured env var would cause undefined token-bucket math.
+        # Both bounded here.
+        safe_refill_rate = max(0.1, float(rate_limit_per_second))
         self._rate_limiter = _TokenBucket(
-            capacity=max(1, int(rate_limit_per_second)),
-            refill_rate=rate_limit_per_second,
+            capacity=max(1, int(safe_refill_rate)),
+            refill_rate=safe_refill_rate,
         )
         self._daily_counter = DailyCounter(budget=daily_budget, persist_path=daily_counter_path)
         self._http: httpx.AsyncClient | None = None
@@ -257,7 +261,14 @@ class EtsyClient:
             return {}
         try:
             return response.json()
-        except Exception as exc:
+        except (JSONDecodeError, ValueError, UnicodeDecodeError) as exc:
+            # Cycle 3 fix: narrow the bare `except Exception` to specific JSON
+            # parse errors. The previous broad catch could mask MemoryError,
+            # RecursionError, or future httpx-specific exceptions and silently
+            # convert them to "Failed to parse JSON" — debugging hellish.
+            # Note: imported as `from json import JSONDecodeError` not `import
+            # json` because `_request()` has a `json=None` parameter that
+            # would shadow the module reference inside this except clause.
             raise EtsyError(
                 f"Failed to parse JSON response from {method} {path}",
                 status=response.status_code,

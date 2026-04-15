@@ -576,3 +576,42 @@ class TestRefreshLockSerialization:
         assert all(r.access_token == token_endpoint_success["access_token"] for r in results)
         # The lock should have prevented a duplicate refresh — exactly one network call
         assert call_count["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cycle 3 silent-failure regression guards
+# ---------------------------------------------------------------------------
+
+
+class TestSaveTokensChmodWarning:
+    """Regression guard for Cycle 3 fix: save_tokens parent-dir chmod failure
+    must log a warning, not silently pass. NFS / noexec mounts that refuse
+    chmod could leave the token store more permissive than 0700 with no
+    operator visibility."""
+
+    def test_chmod_failure_logs_warning(self, auth_factory, fake_tokens, monkeypatch, caplog):
+        import logging
+        from pathlib import Path
+
+        auth = auth_factory()
+        # Force the parent-dir chmod call to raise OSError
+        original_chmod = Path.chmod
+
+        def fake_chmod(self, mode):
+            if self == auth.token_path.parent:
+                raise OSError("Operation not permitted (NFS mount)")
+            return original_chmod(self, mode)
+
+        monkeypatch.setattr(Path, "chmod", fake_chmod)
+        caplog.set_level(logging.WARNING, logger="etsy_core.auth")
+
+        # save_tokens must succeed despite the chmod failure (it's not critical)
+        # but it MUST log a warning so the operator sees the permission drift
+        auth.save_tokens(fake_tokens)
+
+        warning_messages = [
+            record.message for record in caplog.records if record.levelno >= logging.WARNING
+        ]
+        assert any(
+            "Could not enforce 0700" in msg for msg in warning_messages
+        ), f"Expected 'Could not enforce 0700' warning, got: {warning_messages}"

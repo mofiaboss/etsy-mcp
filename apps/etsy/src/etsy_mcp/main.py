@@ -62,11 +62,14 @@ def _install_permissioned_tool(server) -> None:
             logger=logger,
         )
         logger.info("permissioned_tool decorator installed with %d categories", len(ETSY_CATEGORY_MAP))
-    except ImportError as exc:
-        logger.warning(
-            "etsy-mcp-shared not installed (import failed: %s). "
-            "Running without permissioned_tool wrapper — tools will work but policy gates are disabled.",
-            exc,
+    except ImportError:
+        # Cycle 3 fix P1-5: log at ERROR with exc_info so a SyntaxError or
+        # broken submodule import inside etsy-mcp-shared surfaces with a
+        # full traceback instead of a misleading "not installed" warning.
+        logger.error(
+            "Failed to import etsy-mcp-shared — running without permissioned_tool wrapper. "
+            "Tools will work but policy gates are disabled. See traceback for root cause:",
+            exc_info=True,
         )
 
 
@@ -97,8 +100,17 @@ def _register_tools() -> None:
         try:
             __import__(f"etsy_mcp.tools.{name}")
             registered += 1
-        except ImportError as exc:
-            logger.warning("Tool module etsy_mcp.tools.%s not available: %s", name, exc)
+        except ImportError:
+            # Cycle 3 fix P1-5: log at ERROR with exc_info. A broken submodule
+            # import (typo in a helper, missing dep) used to surface as a bland
+            # WARNING with no traceback chain — operators saw "not available"
+            # and assumed the module didn't exist when in reality it failed
+            # mid-load. The full traceback now identifies the root cause.
+            logger.error(
+                "Tool module etsy_mcp.tools.%s failed to import:",
+                name,
+                exc_info=True,
+            )
         except Exception as exc:
             logger.error("Failed to import etsy_mcp.tools.%s: %s", name, exc, exc_info=True)
 

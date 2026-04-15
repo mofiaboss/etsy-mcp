@@ -244,6 +244,14 @@ class ShopManager:
             maybe_results = sections_response.get("results")
             results = maybe_results if isinstance(maybe_results, list) else []
         else:
+            # Cycle 3 fix: log the unexpected shape so operators can tell
+            # "API contract violation" apart from "section not found". The
+            # caller raises EtsyValidationError("section not found") which
+            # would otherwise mask a real Etsy response-shape change.
+            logger.warning(
+                "Unexpected sections_list response shape: %s (expected dict or list)",
+                type(sections_response).__name__,
+            )
             return None
 
         for section in results:

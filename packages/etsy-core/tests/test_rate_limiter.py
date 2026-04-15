@@ -104,3 +104,40 @@ class TestDailyCounter:
         result = counter.reset_at_utc()
         assert "T00:00:00" in result
         assert result.endswith("Z")
+
+
+# ---------------------------------------------------------------------------
+# Capacity floor (Cycle 2 NEW-D, Cycle 3 missing-test gap)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_token_bucket_with_fractional_capacity_does_not_deadlock():
+    """A capacity derived from a fractional rate must floor to 1, not 0.
+
+    The pre-fix EtsyClient code did `int(rate_limit_per_second)` which collapsed
+    rate=0.5 to capacity=0, causing acquire() to spin-wait for a token that
+    could never fit. The fix is at the EtsyClient call site (max(1, int(rate)))
+    but this direct _TokenBucket test pins the floor so a regression is caught.
+    """
+    import asyncio
+    bucket = _TokenBucket(capacity=1, refill_rate=0.5)
+    # Acquire should complete without hanging
+    await asyncio.wait_for(bucket.acquire(1.0), timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_etsy_client_with_fractional_rate_limit_does_not_deadlock(monkeypatch):
+    """End-to-end: instantiate EtsyClient with rate_limit_per_second=0.5 and
+    verify the token bucket doesn't deadlock at acquire time (P1-B regression).
+    """
+    import asyncio
+
+    from etsy_core.auth import EtsyAuth
+    from etsy_core.client import EtsyClient
+
+    auth = EtsyAuth(keystring="test", token_path=None)
+    client = EtsyClient(auth=auth, rate_limit_per_second=0.5, daily_budget=100)
+    # Direct rate limiter acquire must not hang
+    await asyncio.wait_for(client._rate_limiter.acquire(1.0), timeout=2.0)
+    await client.close()

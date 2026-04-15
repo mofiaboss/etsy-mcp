@@ -252,11 +252,19 @@ class EtsyAuth:
         Uses write-to-temp + rename for atomicity. Survives crashes mid-write.
         """
         self.token_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Ensure parent dir is 0700 even if it already existed
+        # Ensure parent dir is 0700 even if it already existed.
+        # Cycle 3 fix: log warning on chmod failure instead of bare pass —
+        # silent permission drift on NFS / noexec mounts could leave the
+        # token store world-readable with no operator visibility.
         try:
             self.token_path.parent.chmod(0o700)
-        except OSError:
-            pass  # Not critical if chmod fails on existing dir
+        except OSError as exc:
+            logger.warning(
+                "Could not enforce 0700 mode on config dir %s: %s. "
+                "Token store may be more permissive than intended.",
+                self.token_path.parent,
+                exc,
+            )
 
         tmp_path = self.token_path.with_suffix(".tmp")
         try:
@@ -265,12 +273,18 @@ class EtsyAuth:
             os.replace(tmp_path, self.token_path)
             self._tokens = tokens
         except OSError as exc:
-            # Clean up temp file on failure
+            # Clean up temp file on failure. Log the cleanup outcome at debug
+            # level — Cycle 3 fix: don't silently swallow the inner OSError,
+            # operators investigating a stale .tmp file deserve a breadcrumb.
             if tmp_path.exists():
                 try:
                     tmp_path.unlink()
-                except OSError:
-                    pass
+                except OSError as cleanup_exc:
+                    logger.debug(
+                        "Could not clean up temp token file %s after save failure: %s",
+                        tmp_path,
+                        cleanup_exc,
+                    )
             raise EtsyAuthError(f"Failed to write token store at {self.token_path}") from exc
 
     # -------------------------------------------------------------------------

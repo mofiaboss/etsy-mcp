@@ -301,3 +301,72 @@ async def test_sections_update_updating_rank_preserves_title(
     assert sent["rank"] == 5
     # Preserved from section 222 in the fixture
     assert sent["title"] == "Art"
+
+
+# ---------------------------------------------------------------------------
+# _find_section dual-shape coverage (Cycle 3 NEW gap)
+# ---------------------------------------------------------------------------
+
+
+def test_find_section_handles_wrapped_dict_shape() -> None:
+    """Verify _find_section locates a section in {"results": [...]} response."""
+    response = {
+        "count": 2,
+        "results": [
+            {"shop_section_id": 100, "title": "Hats"},
+            {"shop_section_id": 200, "title": "Scarves"},
+        ],
+    }
+    found = ShopManager._find_section(response, 200)
+    assert found is not None
+    assert found["title"] == "Scarves"
+
+
+def test_find_section_handles_bare_list_shape() -> None:
+    """Verify _find_section locates a section in a bare list response."""
+    response = [
+        {"shop_section_id": 100, "title": "Hats"},
+        {"shop_section_id": 200, "title": "Scarves"},
+    ]
+    found = ShopManager._find_section(response, 100)  # type: ignore[arg-type]
+    assert found is not None
+    assert found["title"] == "Hats"
+
+
+def test_find_section_returns_none_for_missing_section() -> None:
+    response = {"count": 1, "results": [{"shop_section_id": 100}]}
+    assert ShopManager._find_section(response, 999) is None
+
+
+def test_find_section_returns_none_for_empty_results() -> None:
+    assert ShopManager._find_section({"count": 0, "results": []}, 1) is None
+
+
+def test_find_section_returns_none_for_empty_list() -> None:
+    assert ShopManager._find_section([], 1) is None  # type: ignore[arg-type]
+
+
+def test_find_section_handles_unexpected_shape_logs_warning(caplog) -> None:
+    """Unrecognized shape (string, int) returns None AND logs a warning so
+    operators can distinguish API contract violation from 'not found'."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="etsy_mcp.managers.shop_manager")
+    result = ShopManager._find_section("unexpected string body", 1)  # type: ignore[arg-type]
+    assert result is None
+    assert any(
+        "Unexpected sections_list response shape" in record.message
+        for record in caplog.records
+    )
+
+
+def test_find_section_skips_non_dict_items_in_list() -> None:
+    """A list containing non-dict items should be tolerated, not crash."""
+    response = [
+        "garbage",
+        {"shop_section_id": 100, "title": "Hats"},
+        42,
+    ]
+    found = ShopManager._find_section(response, 100)  # type: ignore[arg-type]
+    assert found is not None
+    assert found["title"] == "Hats"

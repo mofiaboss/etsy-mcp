@@ -494,10 +494,20 @@ class ListingManager:
                     }
                 )
             except Exception as exc:  # noqa: BLE001 — bulk isolation
+                # Cycle 3 fix P1-7: log with full traceback before swallowing.
+                # The previous version recorded only the exception class name in
+                # the failed dict and emitted no log at all — operators chasing
+                # a 3am bulk failure had nothing to grep on. Now we both log
+                # the traceback AND include str(exc) in the envelope so callers
+                # see the actual error message, not just the class.
+                logger.exception(
+                    "bulk_create_from_template: item %d unexpected failure",
+                    idx,
+                )
                 failed.append(
                     {
                         "index": idx,
-                        "error": f"Unexpected error: {exc.__class__.__name__}",
+                        "error": f"Unexpected error: {exc.__class__.__name__}: {exc}",
                         "error_type": exc.__class__.__name__,
                         "template_title": (raw.get("title") if isinstance(raw, dict) else None),
                     }
@@ -562,11 +572,17 @@ class ListingManager:
                     }
                 )
             except Exception as exc:  # noqa: BLE001 — bulk isolation
+                # Cycle 3 fix P1-7: log with full traceback + include exc message.
+                logger.exception(
+                    "bulk_update_from_template: item %d (listing_id=%s) unexpected failure",
+                    idx,
+                    listing_id,
+                )
                 failed.append(
                     {
                         "index": idx,
                         "listing_id": listing_id,
-                        "error": f"Unexpected error: {exc.__class__.__name__}",
+                        "error": f"Unexpected error: {exc.__class__.__name__}: {exc}",
                         "error_type": exc.__class__.__name__,
                     }
                 )
