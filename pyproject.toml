@@ -1,0 +1,17 @@
+[project]
+name = "etsy-mcp-workspace"
+version = "0.0.0"
+description = "Etsy MCP ecosystem workspace root — the installable package is apps/etsy (name: etsy-mcp). This root exists only to group the workspace members."
+requires-python = ">=3.13"
+
+[tool.uv.workspace]
+members = [
+    "apps/*",
+    "packages/*",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

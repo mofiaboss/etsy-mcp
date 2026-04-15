@@ -1,0 +1,38 @@
+[project]
+name = "etsy-mcp-shared"
+dynamic = ["version"]
+description = "Shared MCP server patterns: permissions, confirmation, lazy loading, config"
+requires-python = ">=3.13"
+dependencies = [
+    "mcp[cli]>=1.26.0,<2",
+    "omegaconf>=2.3.0",
+    "pyyaml>=6.0",
+    "jsonschema>=4.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options.root = "../.."
+raw-options.tag_regex = "^shared/v(?P<version>\\d+(?:\\.\\d+)*)(?:\\S*)$"
+raw-options.git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "shared/v*"]
+raw-options.fallback_version = "0.0.0"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/etsy_mcp_shared/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/etsy_mcp_shared"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

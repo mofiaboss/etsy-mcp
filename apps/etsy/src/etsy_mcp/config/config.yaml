@@ -1,0 +1,18 @@
+# etsy-mcp default configuration
+# Override any value via env vars. Syntax: ${oc.env:VAR_NAME,default_value}
+
+etsy:
+  keystring: ${oc.env:ETSY_KEYSTRING,}
+  shared_secret: ${oc.env:ETSY_SHARED_SECRET,}
+  api_base: ${oc.env:ETSY_API_BASE,https://api.etsy.com/v3/application}
+  timeout_seconds: ${oc.env:ETSY_TIMEOUT_SECONDS,15}
+  rate_limit_per_second: ${oc.env:ETSY_RATE_LIMIT_PER_SECOND,10}
+  rate_limit_per_day: ${oc.env:ETSY_RATE_LIMIT_PER_DAY,10000}
+  token_store: ${oc.env:ETSY_TOKEN_STORE,}
+  refresh_token_env: ${oc.env:ETSY_REFRESH_TOKEN,}
+
+server:
+  name: etsy-mcp
+  log_level: ${oc.env:ETSY_LOG_LEVEL,INFO}
+  permission_mode: ${oc.env:ETSY_TOOL_PERMISSION_MODE,confirm}
+  diagnostics_enabled: ${oc.env:ETSY_DIAGNOSTICS_ENABLED,false}
